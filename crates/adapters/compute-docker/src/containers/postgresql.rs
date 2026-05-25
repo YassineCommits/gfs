@@ -20,6 +20,7 @@ const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";
 const ENV_USER: &str = "POSTGRES_USER";
 const ENV_PASSWORD: &str = "POSTGRES_PASSWORD";
 const ENV_DB: &str = "POSTGRES_DB";
+const ENV_PGDATA: &str = "PGDATA";
 
 const DEFAULT_USER: &str = "postgres";
 const DEFAULT_PASSWORD: &str = "postgres";
@@ -50,6 +51,10 @@ impl PostgresqlProvider {
                 EnvVar {
                     name: ENV_DB.to_string(),
                     default: Some(DEFAULT_DB.to_string()),
+                },
+                EnvVar {
+                    name: ENV_PGDATA.to_string(),
+                    default: Some(CONTAINER_DATA_DIR.to_string()),
                 },
             ],
             ports: vec![PortMapping {
@@ -631,6 +636,21 @@ mod tests {
         let provider = PostgresqlProvider::new();
         assert_eq!(provider.name(), "postgres");
         assert_eq!(provider.default_port(), 5432);
+    }
+
+    #[test]
+    fn definition_pins_pgdata_to_mounted_data_dir() {
+        // PostgreSQL 18's image moved the default PGDATA; pinning PGDATA to the
+        // bind-mounted path keeps the data dir consistent across all versions.
+        let provider = PostgresqlProvider::new();
+        let def = provider.definition();
+        let pgdata = def
+            .env
+            .iter()
+            .find(|e| e.name == "PGDATA")
+            .expect("PGDATA env var must be set");
+        assert_eq!(pgdata.default.as_deref(), Some(CONTAINER_DATA_DIR));
+        assert_eq!(def.data_dir.to_string_lossy(), CONTAINER_DATA_DIR);
     }
 
     #[test]
