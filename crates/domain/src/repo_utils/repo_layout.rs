@@ -132,6 +132,7 @@ pub fn init_repo_layout(working_dir: &Path, mount_point: Option<String>) -> Resu
         environment: None,
         runtime: None,
         storage: None,
+        remote: None,
     };
 
     let config_path = gfs_dir.join(CONFIG_FILE);
