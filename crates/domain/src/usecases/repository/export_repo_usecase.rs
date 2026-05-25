@@ -476,6 +476,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
+            remote: None,
         };
         config.save(dir).unwrap();
     }
@@ -549,6 +550,7 @@ mod tests {
                 container_name: "c1".into(),
             }),
             storage: None,
+            remote: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -582,6 +584,7 @@ mod tests {
                 container_name: "".into(),
             }),
             storage: None,
+            remote: None,
         };
         config.save(dir.path()).unwrap();
 
