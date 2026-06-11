@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use gfs_compute_docker::DockerCompute;
+use gfs_domain::model::config::GfsConfig;
 use gfs_domain::model::datasource::diff::compute_schema_diff;
 use gfs_domain::model::datasource::diff_formatter::{
     AgenticFormatter, JsonFormatter, PrettyFormatter,
@@ -23,6 +24,12 @@ pub async fn run_extract(
     compact: bool,
 ) -> Result<()> {
     let repo_path = path.unwrap_or_else(get_repo_dir);
+
+    // Validate the repo before touching Docker: on a machine without Docker the
+    // right error for a non-repo is still "not a gfs repository", not a Docker one.
+    GfsConfig::load(&repo_path).context(
+        "schema extraction failed: not a gfs repository (use --path <repo> or run from a repo)",
+    )?;
 
     let compute = Arc::new(DockerCompute::new().map_err(|e| anyhow::anyhow!("{e}"))?);
 
