@@ -1201,6 +1201,11 @@ impl Compute for KubernetesCompute {
                 containers: vec![Container {
                     name: "task".to_string(),
                     image: Some(definition.image.clone()),
+                    // Task images often carry a floating tag (`postgres:latest`),
+                    // where kubelet defaults to `Always` and re-pulls on every
+                    // task — minutes per commit on a slow link. The cached image
+                    // is fine for short-lived helper tasks.
+                    image_pull_policy: Some("IfNotPresent".to_string()),
                     env: Some(env),
                     command: Some(vec![
                         "sh".to_string(),
@@ -1224,9 +1229,11 @@ impl Compute for KubernetesCompute {
             .await
             .map_err(|e| ComputeError::Internal(format!("k8s task pod create failed: {e}")))?;
 
-        // Wait briefly for completion by polling phase.
+        // Wait for completion by polling phase. Generous window: a first use of
+        // an image still pays one pull, and giving up early deletes the pod
+        // mid-pull (the task then reports failure with empty logs).
         let mut last_pod: Option<Pod> = None;
-        for _ in 0..120 {
+        for _ in 0..360 {
             let p = pods
                 .get(&name)
                 .await
