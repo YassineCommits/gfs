@@ -7,7 +7,10 @@
 //!
 //! Notes:
 //! - `pause`/`unpause` are not supported (no cgroup freezer equivalent).
-//! - `host_data_dir` in `ComputeDefinition` is ignored (docker-specific).
+//! - `host_data_dir` in `ComputeDefinition`: instances (`provision`) only use
+//!   the `pvc:<name>` form to pick a PVC; task pods (`run_task`) mount it at
+//!   `data_dir` (`pvc:<name>` → that PVC, plain path → hostPath, valid on
+//!   single-node k3s where kubelet and the gfs host share a filesystem).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1148,6 +1151,44 @@ impl Compute for KubernetesCompute {
             });
         }
 
+        // Honour the Compute contract: `host_data_dir` mounts at `data_dir` so
+        // files the task writes (e.g. schema/DDL exports) land where the caller
+        // can read them. `pvc:<name>` selects that PVC (same convention as
+        // `pvc_name_for`); any other path is a hostPath, which holds on
+        // single-node k3s where the kubelet and the gfs host share a filesystem.
+        let mut volumes: Option<Vec<Volume>> = None;
+        let mut volume_mounts: Option<Vec<VolumeMount>> = None;
+        if let Some(ref host_data) = definition.host_data_dir {
+            let host_data = host_data.to_string_lossy();
+            let host_data = host_data.trim();
+            let volume_source = match host_data.strip_prefix("pvc:") {
+                Some(pvc) => Volume {
+                    name: "task-data".to_string(),
+                    persistent_volume_claim: Some(
+                        k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                            claim_name: pvc.trim().to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+                None => Volume {
+                    name: "task-data".to_string(),
+                    host_path: Some(k8s_openapi::api::core::v1::HostPathVolumeSource {
+                        path: host_data.to_string(),
+                        type_: Some("DirectoryOrCreate".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            };
+            volumes = Some(vec![volume_source]);
+            volume_mounts = Some(vec![VolumeMount {
+                name: "task-data".to_string(),
+                mount_path: definition.data_dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            }]);
+        }
+
         let pod = Pod {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
@@ -1166,8 +1207,14 @@ impl Compute for KubernetesCompute {
                         "-c".to_string(),
                         command.to_string(),
                     ]),
+                    volume_mounts,
                     ..Default::default()
                 }],
+                volumes,
+                // A hostPath only honours the contract if the pod lands on the
+                // node that shares the gfs host filesystem.
+                node_selector: k8s_schedule_node_name()
+                    .map(|n| BTreeMap::from([("kubernetes.io/hostname".to_string(), n)])),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1178,6 +1225,7 @@ impl Compute for KubernetesCompute {
             .map_err(|e| ComputeError::Internal(format!("k8s task pod create failed: {e}")))?;
 
         // Wait briefly for completion by polling phase.
+        let mut last_pod: Option<Pod> = None;
         for _ in 0..120 {
             let p = pods
                 .get(&name)
@@ -1187,23 +1235,58 @@ impl Compute for KubernetesCompute {
                 .status
                 .as_ref()
                 .and_then(|s| s.phase.as_deref())
-                .unwrap_or("Unknown");
+                .unwrap_or("Unknown")
+                .to_string();
+            last_pod = Some(p);
             if phase == "Succeeded" || phase == "Failed" {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
 
+        // Real exit code from the terminated container; a pod that never
+        // reached a terminal phase (image pull stuck, scheduling failure)
+        // counts as failed, not as silent success.
+        let phase = last_pod
+            .as_ref()
+            .and_then(|p| p.status.as_ref())
+            .and_then(|s| s.phase.as_deref())
+            .unwrap_or("Unknown")
+            .to_string();
+        let exit_code = if phase == "Succeeded" {
+            0
+        } else {
+            last_pod
+                .as_ref()
+                .and_then(|p| p.status.as_ref())
+                .and_then(|s| s.container_statuses.as_ref())
+                .and_then(|cs| cs.first())
+                .and_then(|c| c.state.as_ref())
+                .and_then(|st| st.terminated.as_ref())
+                .map(|t| t.exit_code)
+                .unwrap_or(1)
+        };
+
         let log = pods
             .logs(&name, &kube::api::LogParams::default())
             .await
             .unwrap_or_default();
         let _ = pods.delete(&name, &DeleteParams::default()).await;
-        Ok(ExecOutput {
-            exit_code: 0,
-            stdout: log,
-            stderr: String::new(),
-        })
+        if exit_code == 0 {
+            Ok(ExecOutput {
+                exit_code,
+                stdout: log,
+                stderr: String::new(),
+            })
+        } else {
+            // Pod logs merge stdout/stderr; surface them as stderr so callers
+            // that report task failures (e.g. export's TaskFailed) show them.
+            Ok(ExecOutput {
+                exit_code,
+                stdout: String::new(),
+                stderr: log,
+            })
+        }
     }
 }
 
