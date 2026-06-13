@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use gfs_domain::ports::compute::{ComputeDefinition, EnvVar, PortMapping};
 use gfs_domain::ports::database_provider::{
-    ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg, DatabaseProviderRegistry,
-    ExportSpec, ImportSpec, ProviderError, Result, SIGTERM, SchemaExtractionSpec, SupportedFeature,
+    CloneSpec, ConnectionParams, DataFormat, DatabaseProvider, DatabaseProviderArg,
+    DatabaseProviderRegistry, ExportSpec, ImportSpec, ProviderError, RemoteSource, Result, SIGTERM,
+    SchemaExtractionSpec, SupportedFeature,
 };
 
 const NAME: &str = "postgres";
@@ -38,6 +39,7 @@ impl PostgresqlProvider {
 
     fn definition_impl() -> ComputeDefinition {
         ComputeDefinition {
+            labels: Default::default(),
             image: DEFAULT_IMAGE.to_string(),
             env: vec![
                 EnvVar {
@@ -77,8 +79,13 @@ impl PostgresqlProvider {
                 value: "shared_buffers=32MB".into(),
             },
             DatabaseProviderArg {
+                // 16MB (vs the 2MB minimum): lets the planner pick a hash join
+                // (O(N+M)) instead of a nested-loop join-filter (O(N×M)) when a
+                // query still federates a multi-table join before warming has made
+                // the tables local — the difference between a pegged core and a
+                // bounded scan. Overridable via clone params.
                 name: "-c".into(),
-                value: "work_mem=2MB".into(),
+                value: "work_mem=16MB".into(),
             },
             DatabaseProviderArg {
                 name: "-c".into(),
@@ -142,6 +149,43 @@ impl Default for PostgresqlProvider {
     }
 }
 
+/// Resolve `(user, password, db)` from connection params, falling back to the
+/// provider defaults. Shared by every spec that builds a psql/pg_* command.
+fn conn_creds(params: &ConnectionParams) -> (&str, &str, &str) {
+    (
+        params.get_env(ENV_USER).unwrap_or(DEFAULT_USER),
+        params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD),
+        params.get_env(ENV_DB).unwrap_or(DEFAULT_DB),
+    )
+}
+
+/// Wrap a value in single quotes for safe use in a `sh -c` command, escaping any
+/// embedded single quote (`'` -> `'\''`).
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the ephemeral tool-sidecar `ComputeDefinition` shared by export,
+/// import, schema-extraction, and clone: the database image with `PGPASSWORD`
+/// set and the data exchange directory mounted at `data_dir`.
+fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeDefinition {
+    ComputeDefinition {
+        labels: Default::default(),
+        image,
+        env: vec![EnvVar {
+            name: "PGPASSWORD".into(),
+            default: Some(password.to_string()),
+        }],
+        ports: vec![],
+        data_dir: PathBuf::from(data_dir),
+        host_data_dir: None, // set by the orchestrator when needed
+        user: None,
+        logs_dir: None,
+        conf_dir: None,
+        args: vec![],
+    }
+}
+
 impl DatabaseProvider for PostgresqlProvider {
     fn name(&self) -> &str {
         NAME
@@ -165,6 +209,22 @@ impl DatabaseProvider for PostgresqlProvider {
         Self::default_args_impl()
     }
 
+    /// PostgreSQL takes runtime settings as repeated `-c name=value` flags; the
+    /// last occurrence wins, so these (appended after the defaults) override
+    /// `default_args` (e.g. `max_connections=200`).
+    fn render_param_overrides(
+        &self,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        params
+            .iter()
+            .map(|(k, v)| DatabaseProviderArg {
+                name: "-c".into(),
+                value: format!("{k}={v}"),
+            })
+            .collect()
+    }
+
     fn default_signal(&self) -> u32 {
         SIGTERM
     }
@@ -173,9 +233,7 @@ impl DatabaseProvider for PostgresqlProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<String, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
         Ok(format!(
             "postgresql://{}:{}@{}:{}/{}",
             user, password, params.host, params.port, db
@@ -303,9 +361,7 @@ impl DatabaseProvider for PostgresqlProvider {
         params: &ConnectionParams,
         format: &str,
     ) -> std::result::Result<ExportSpec, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         let (pg_format, filename, schema_only) = match format {
             "sql" => ("plain", "export.sql", false),
@@ -317,20 +373,7 @@ impl DatabaseProvider for PostgresqlProvider {
         let schema_flag = if schema_only { " --schema-only" } else { "" };
 
         Ok(ExportSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None, // set by orchestrator
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/data"),
             command: format!(
                 "pg_dump -h {host} -p {port} -U {user} -d {db} --format={fmt}{schema_flag} -f /data/{file}",
                 host = params.host,
@@ -351,9 +394,7 @@ impl DatabaseProvider for PostgresqlProvider {
         format: &str,
         input_filename: &str,
     ) -> std::result::Result<ImportSpec, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         let command = match format {
             "sql" => format!(
@@ -384,22 +425,95 @@ impl DatabaseProvider for PostgresqlProvider {
         };
 
         Ok(ImportSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/data"),
-                host_data_dir: None, // set by orchestrator
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/data"),
             command,
             input_filename: input_filename.to_string(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
+    // -----------------------------------------------------------------------
+
+    fn clone_bootstrap_spec(
+        &self,
+        local: &ConnectionParams,
+        remote: &RemoteSource,
+    ) -> std::result::Result<CloneSpec, ProviderError> {
+        let (user, password, db) = conn_creds(local);
+
+        let bootstrap_sql = build_clone_bootstrap_sql(remote);
+
+        // Step 1 — FAITHFUL schema: dump the remote's DDL (tables, triggers,
+        // functions, indexes, constraints, sequences, types) and replay it onto
+        // the local clone, so the source's real objects exist as real tables (not
+        // overlay views). The overlay (gfs_ovl__<schema>) is layered on top by the
+        // bootstrap. `--no-owner --no-privileges` avoids depending on remote roles;
+        // restrict to the requested schemas when given.
+        let schema_flags = remote
+            .schemas
+            .iter()
+            .map(|s| format!(" -n {}", shell_single_quote(s)))
+            .collect::<String>();
+        let dump = format!(
+            "PGPASSWORD={rpass} pg_dump -h {rhost} -p {rport} -U {ruser} -d {rdb} --schema-only --no-owner --no-privileges{schemas} -f /tmp/gfs_faithful.sql",
+            rpass = shell_single_quote(&remote.password),
+            rhost = remote.host,
+            rport = remote.port,
+            ruser = remote.user,
+            rdb = remote.dbname,
+            schemas = schema_flags,
+        );
+
+        // Step 1b — sanitize the dump for cross-version replay. A pg_dump client
+        // >= 17 unconditionally emits `SET transaction_timeout = 0;` in the header,
+        // but that GUC only exists on a server >= 17. Replaying it onto an older
+        // local server raises "unrecognized configuration parameter" — harmless to
+        // the schema, noisy in the logs, and fatal if anything ever tightens the
+        // replay to ON_ERROR_STOP. Strip the line; it is irrelevant to a DDL replay.
+        let sanitize = "sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql";
+
+        // Step 2 — replay the faithful schema into the LOCAL database. Best-effort
+        // (no ON_ERROR_STOP): an object that can't be recreated locally (e.g. a
+        // missing extension) is skipped, and its table is later skipped by the
+        // overlay builder, rather than aborting the whole clone.
+        let replay = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -f /tmp/gfs_faithful.sql || true",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        // Step 3 — bootstrap FDW + overlay (fed via a quoted heredoc; no shell
+        // expansion inside). ON_ERROR_STOP=1 so a real failure fails the clone.
+        let bootstrap = format!(
+            "psql -h {host} -p {port} -U {user} -d {db} -v ON_ERROR_STOP=1 <<'GFS_CLONE_BOOTSTRAP'\n{sql}\nGFS_CLONE_BOOTSTRAP\n",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+            sql = bootstrap_sql,
+        );
+
+        // Step 1c — wait for the clone to actually ACCEPT QUERIES before replaying
+        // onto it. The engine's port can be open (and the framework's TCP readiness
+        // probe satisfied) while postgres is still starting up, especially under
+        // host load -- replaying then fails with "connection refused". Poll a real
+        // SELECT 1 (same creds as the replay, via the sidecar's PGPASSWORD).
+        let wait_clone = format!(
+            "for i in $(seq 1 120); do if psql -h {host} -p {port} -U {user} -d {db} -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 1; done",
+            host = local.host,
+            port = local.port,
+            user = user,
+            db = db,
+        );
+
+        let command = format!("set -e\n{dump}\n{sanitize}\n{wait_clone}\n{replay}\n{bootstrap}");
+
+        Ok(CloneSpec {
+            definition: sidecar_definition(self.definition().image, password, "/data"),
+            command,
         })
     }
 
@@ -412,9 +526,7 @@ impl DatabaseProvider for PostgresqlProvider {
         params: &ConnectionParams,
         query: Option<&str>,
     ) -> std::result::Result<std::process::Command, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
 
         // Build psql command with connection parameters
         let mut cmd = std::process::Command::new("psql");
@@ -530,9 +642,7 @@ impl DatabaseProvider for PostgresqlProvider {
         &self,
         params: &ConnectionParams,
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
-        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
-        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
-        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+        let (user, password, db) = conn_creds(params);
         let queries = self.schema_extraction_queries();
         let schemas_q = queries
             .get("schemas")
@@ -575,20 +685,7 @@ COLUMNS_EOF
         );
 
         Ok(Some(SchemaExtractionSpec {
-            definition: ComputeDefinition {
-                image: self.definition().image,
-                env: vec![EnvVar {
-                    name: "PGPASSWORD".into(),
-                    default: Some(password.to_string()),
-                }],
-                ports: vec![],
-                data_dir: PathBuf::from("/tmp"),
-                host_data_dir: None,
-                user: None,
-                logs_dir: None,
-                conf_dir: None,
-                args: vec![],
-            },
+            definition: sidecar_definition(self.definition().image, password, "/tmp"),
             command,
         }))
     }
@@ -597,6 +694,64 @@ COLUMNS_EOF
 /// Registers the PostgreSQL provider in `registry` under the name `"postgres"`.
 pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
     registry.register(Arc::new(PostgresqlProvider::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Lazy-clone bootstrap SQL generation (RFC 008)
+// ---------------------------------------------------------------------------
+
+/// The overlay bootstrap template, kept as a real `.sql` file (proper syntax
+/// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
+/// `build_clone_bootstrap_sql`.
+const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
+
+/// Escape a value for use inside a single-quoted SQL string literal.
+fn sql_lit(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Build the bootstrap SQL run inside the local GFS database to set up a lazy
+/// (copy-on-read) clone of `remote`, using the **overlay** mechanic.
+///
+/// Installs `postgres_fdw` + `dblink`, imports the remote schema as foreign
+/// tables, and — for each remote table with a single-column primary key —
+/// creates a local store, a delete-tombstone table, an updatable overlay view
+/// (local wins; remote rows only if neither local nor tombstoned), and
+/// `INSTEAD OF` triggers for copy-on-write. No data is copied.
+///
+/// Correctness is guaranteed by the view (disjoint row sets), independent of
+/// hydration. The mechanic is the one validated by
+/// `docs/rfcs/008-remote-clone/poc-overlay`.
+fn build_clone_bootstrap_sql(remote: &RemoteSource) -> String {
+    // dblink connection string, used only for read-only introspection of the
+    // remote (schema/table/key discovery).
+    let conn = format!(
+        "host={} port={} dbname={} user={} password={}",
+        remote.host, remote.port, remote.dbname, remote.user, remote.password,
+    );
+
+    // SQL array literal of schemas to mirror, or NULL meaning "all user schemas".
+    let schemas_array = if remote.schemas.is_empty() {
+        "NULL::text[]".to_string()
+    } else {
+        let items: Vec<String> = remote
+            .schemas
+            .iter()
+            .map(|s| format!("'{}'", sql_lit(s)))
+            .collect();
+        format!("ARRAY[{}]::text[]", items.join(", "))
+    };
+
+    let template = CLONE_BOOTSTRAP_TMPL;
+
+    template
+        .replace("__RHOST__", &sql_lit(&remote.host))
+        .replace("__RPORT__", &remote.port.to_string())
+        .replace("__RDB__", &sql_lit(&remote.dbname))
+        .replace("__RUSER__", &sql_lit(&remote.user))
+        .replace("__RPASS__", &sql_lit(&remote.password))
+        .replace("__CONN__", &sql_lit(&conn))
+        .replace("__SCHEMAS_ARRAY__", &schemas_array)
 }
 
 #[cfg(test)]
@@ -905,5 +1060,220 @@ mod tests {
         };
         let spec = provider.export_spec(&params, "sql").unwrap();
         assert_eq!(spec.definition.image, provider.definition().image);
+    }
+
+    // -- lazy clone (RFC 008) ------------------------------------------------
+
+    fn sample_remote() -> RemoteSource {
+        RemoteSource {
+            host: "rds.example.com".into(),
+            port: 5432,
+            dbname: "shop".into(),
+            user: "reader".into(),
+            password: "p@ss".into(),
+            schemas: vec!["public".into()],
+        }
+    }
+
+    fn local_params() -> ConnectionParams {
+        ConnectionParams {
+            host: "172.17.0.2".into(),
+            port: 5432,
+            env: vec![
+                ("POSTGRES_USER".into(), "postgres".into()),
+                ("POSTGRES_PASSWORD".into(), "localpw".into()),
+                ("POSTGRES_DB".into(), "gfs".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_substitutes_remote() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // FDW server + mapping carry the remote connection params (plus the
+        // pushdown/batching knobs: use_remote_estimate + fetch_size).
+        assert!(sql.contains(
+            "OPTIONS (host 'rds.example.com', port '5432', dbname 'shop',\n           \
+             use_remote_estimate 'true', fetch_size '10000')"
+        ));
+        assert!(sql.contains("OPTIONS (user 'reader', password 'p@ss')"));
+        // Requested schemas become an array literal driving the per-schema import.
+        assert!(sql.contains("ARRAY['public']::text[]"));
+        // Per-table import (LIMIT TO) so one bad table cannot abort the clone.
+        assert!(
+            sql.contains(
+                "IMPORT FOREIGN SCHEMA %I LIMIT TO (%I) FROM SERVER gfs_remote_srv INTO %I"
+            )
+        );
+        // Resilience hooks: skip un-importable tables / overlays.
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS %I"));
+        assert!(sql.contains("to_regclass(fq_remote) IS NULL"));
+        // dblink introspection connection string is present.
+        assert!(
+            sql.contains("host=rds.example.com port=5432 dbname=shop user=reader password=p@ss")
+        );
+        // No leftover placeholders (the template still legitimately contains the
+        // reserved `gfs_ovl__` / `__deleted` names, so check the tokens directly).
+        for ph in [
+            "__RHOST__",
+            "__RPORT__",
+            "__RDB__",
+            "__RUSER__",
+            "__RPASS__",
+            "__CONN__",
+            "__SCHEMAS_ARRAY__",
+        ] {
+            assert!(!sql.contains(ph), "leftover placeholder: {ph}");
+        }
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_all_schemas_when_none_requested() {
+        let mut remote = sample_remote();
+        remote.schemas = vec![];
+        let sql = build_clone_bootstrap_sql(&remote);
+        // Empty list → NULL sentinel → gfs_sync.clone discovers all user schemas.
+        assert!(sql.contains("gfs_sync.clone('"));
+        assert!(sql.contains("NULL::text[]"));
+        assert!(sql.contains("array_agg(nspname)"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_requires_gfs_no_overlay_fallback() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+
+        // The copy-on-read extension (gfs) is REQUIRED — there is no overlay
+        // fallback. It is created unconditionally (so it aborts under \set
+        // ON_ERROR_STOP if the image lacks it), NOT in a best-effort wrapper.
+        assert!(sql.contains("CREATE EXTENSION IF NOT EXISTS gfs;"));
+        assert!(!sql.contains("$gfstam$")); // not the old best-effort wrapper
+        assert!(!sql.contains("using the overlay")); // not the old fallback notice
+        // The clone logic is a planner hook in the extension's shared library; it
+        // must be preloaded on every connection to this database.
+        assert!(sql.contains("SET session_preload_libraries"));
+        // clone() builds copy-on-read tables only: the faithful table stays a plain
+        // heap table (NO custom access method) and we register its source.
+        assert!(!sql.contains("SET ACCESS METHOD gfs"));
+        assert!(sql.contains("gfs.register_clone(store_fq::regclass, fq_remote, p_keycols[1])"));
+        assert!(sql.contains("PERFORM gfs_sync.build_clone(rec.nsp, rec.tab, rec.keycols)"));
+        // Foreign keys are dropped so lazy per-table copy-on-read never trips RI.
+        assert!(sql.contains("contype = 'f'"));
+        assert!(sql.contains("DROP CONSTRAINT"));
+        // No fallback: clone() never calls build_overlay and installs no shim.
+        assert!(!sql.contains("PERFORM gfs_sync.build_overlay"));
+        assert!(!sql.contains("ALTER DATABASE %I SET search_path"));
+        // A probe other components can read to know this is a gfs clone.
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION gfs_sync.clone_tam()"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_mirrors_enum_types() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // User-defined ENUMs are discovered (typtype 'e') and recreated locally
+        // before import, preserving label order.
+        assert!(sql.contains("t.typtype = 'e'"));
+        assert!(sql.contains("array_agg(e.enumlabel ORDER BY e.enumsortorder)"));
+        assert!(sql.contains("CREATE TYPE %I.%I AS ENUM (%s)"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_mirrors_domain_and_composite_types() {
+        let sql = build_clone_bootstrap_sql(&sample_remote());
+        // DOMAINs: base type + constraints recreated.
+        assert!(sql.contains("t.typtype = 'd'"));
+        assert!(sql.contains("CREATE DOMAIN %I.%I AS %s%s%s %s"));
+        assert!(sql.contains("pg_get_constraintdef(c.oid)"));
+        // COMPOSITEs: attribute list recreated, multi-pass for dependencies.
+        assert!(sql.contains("t.typtype = 'c' AND c.relkind = 'c'"));
+        assert!(sql.contains("CREATE TYPE %I.%I AS (%s)"));
+        assert!(sql.contains("FOR pass IN 1..10 LOOP"));
+        assert!(sql.contains("to_regtype(format('%I.%I', comptyp.nsp, comptyp.typ)) IS NOT NULL"));
+    }
+
+    #[test]
+    fn clone_bootstrap_sql_escapes_single_quotes() {
+        let mut remote = sample_remote();
+        remote.password = "a'b".into();
+        let sql = build_clone_bootstrap_sql(&remote);
+        // Single quote is doubled inside the SQL string literal.
+        assert!(sql.contains("password 'a''b'"));
+    }
+
+    #[test]
+    fn render_param_overrides_emits_dash_c_pairs() {
+        let provider = PostgresqlProvider::new();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        params.insert("shared_buffers".to_string(), "256MB".to_string());
+        let args = provider.render_param_overrides(&params);
+        assert_eq!(args.len(), 2);
+        // BTreeMap iterates in sorted key order: max_connections before shared_buffers.
+        assert_eq!(args[0].name, "-c");
+        assert_eq!(args[0].value, "max_connections=200");
+        assert_eq!(args[1].value, "shared_buffers=256MB");
+    }
+
+    #[test]
+    fn definition_with_overrides_appends_after_defaults_so_override_wins() {
+        let provider = PostgresqlProvider::new();
+        let base = provider.definition();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("max_connections".to_string(), "200".to_string());
+        let def = provider.definition_with_overrides(&params);
+        // Override is appended after the default args (last `-c` wins in PostgreSQL).
+        assert_eq!(def.args.len(), base.args.len() + 2);
+        assert_eq!(def.args.last(), Some(&"max_connections=200".to_string()));
+        let last_default = base
+            .args
+            .iter()
+            .rposition(|a| a == "max_connections=10")
+            .expect("default max_connections present");
+        let override_pos = def
+            .args
+            .iter()
+            .rposition(|a| a == "max_connections=200")
+            .expect("override present");
+        assert!(
+            override_pos > last_default,
+            "override must come after default"
+        );
+    }
+
+    #[test]
+    fn definition_with_overrides_empty_params_is_noop() {
+        let provider = PostgresqlProvider::new();
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            provider.definition_with_overrides(&empty).args,
+            provider.definition().args
+        );
+    }
+
+    #[test]
+    fn clone_bootstrap_spec_wraps_sql_in_local_psql_heredoc() {
+        let provider = PostgresqlProvider::new();
+        let spec = provider
+            .clone_bootstrap_spec(&local_params(), &sample_remote())
+            .unwrap();
+        // Connects to the LOCAL database.
+        assert!(
+            spec.command
+                .contains("psql -h 172.17.0.2 -p 5432 -U postgres -d gfs")
+        );
+        assert!(spec.command.contains("<<'GFS_CLONE_BOOTSTRAP'"));
+        // Local password is supplied via PGPASSWORD on the sidecar.
+        assert!(
+            spec.definition
+                .env
+                .iter()
+                .any(|e| e.name == "PGPASSWORD" && e.default.as_deref() == Some("localpw"))
+        );
+        assert_eq!(spec.definition.image, provider.definition().image);
+        // The v17-only `transaction_timeout` GUC is stripped from the dump before
+        // replay so a pre-v17 local server doesn't choke on it.
+        assert!(
+            spec.command
+                .contains("sed -i '/^SET transaction_timeout/d' /tmp/gfs_faithful.sql")
+        );
     }
 }

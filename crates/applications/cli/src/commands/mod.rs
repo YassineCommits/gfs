@@ -1,5 +1,6 @@
 pub mod cmd_branch;
 pub mod cmd_checkout;
+pub mod cmd_clone;
 pub mod cmd_commit;
 pub mod cmd_compute;
 pub mod cmd_config;
@@ -9,6 +10,7 @@ pub mod cmd_init;
 pub mod cmd_log;
 pub mod cmd_mcp;
 pub mod cmd_providers;
+pub mod cmd_proxy;
 pub mod cmd_query;
 pub mod cmd_schema;
 pub mod cmd_status;

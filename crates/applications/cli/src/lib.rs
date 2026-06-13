@@ -3,7 +3,9 @@
 //! Provides a programmatic interface to run the CLI. Use `run()` for testing or embedding.
 
 mod cli_utils;
-mod commands;
+/// Command implementations, exported so other crates (e.g. the console) can run
+/// GFS operations in-process instead of shelling out to the `gfs` binary.
+pub mod commands;
 pub mod output;
 
 use std::ffi::OsString;
@@ -134,6 +136,64 @@ pub enum McpAction {
 }
 
 // ---------------------------------------------------------------------------
+// Proxy daemon subcommands (used by commands)
+// ---------------------------------------------------------------------------
+
+/// Shared flags for `gfs proxy start` and `gfs proxy run` (foreground). Defaults
+/// favour the common case: auto-discover GFS clones from Docker labels, warming
+/// on, cache-coverage metrics on.
+#[derive(clap::Args, Clone, Debug)]
+pub struct ProxyStartOpts {
+    /// Pin a single backend (`host:port`). Omit for Docker auto-discovery.
+    #[arg(long)]
+    pub backend: Option<String>,
+
+    /// First listen port assigned to auto-discovered clones (discovery only).
+    #[arg(long, default_value_t = 55500)]
+    pub listen_base: u16,
+
+    /// Address for the proxy's HTTP server (serves `/metrics` and `/clones`).
+    #[arg(long, default_value = "127.0.0.1:9090")]
+    pub metrics: String,
+
+    /// Disable in-DB cache warming (on by default).
+    #[arg(long)]
+    pub no_warm: bool,
+
+    /// Disable periodic in-DB cache-coverage scraping (on by default).
+    #[arg(long)]
+    pub no_cache_metrics: bool,
+
+    /// Extra flags forwarded verbatim to `guepard-proxy-v2`
+    /// (e.g. `gfs proxy start -- --refresh-interval 5 --backend-tls`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<String>,
+}
+
+#[derive(Subcommand)]
+pub enum ProxyAction {
+    /// Start the proxy as a background daemon (writes ~/.gfs/proxy.pid).
+    Start(ProxyStartOpts),
+    /// Stop the proxy daemon.
+    Stop,
+    /// Stop and start the daemon, replaying the previous start arguments.
+    Restart,
+    /// Show daemon status + the live clone→listener map (from `GET /clones`).
+    Status,
+    /// Tail the proxy log file (~/.gfs/proxy.log).
+    Logs {
+        /// Follow new output (like `tail -f`).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Number of last lines to print.
+        #[arg(short = 'n', long, default_value_t = 100)]
+        tail: usize,
+    },
+    /// Run the proxy in the foreground (no detach) — for debugging / systemd.
+    Run(ProxyStartOpts),
+}
+
+// ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
@@ -187,6 +247,35 @@ enum TopLevel {
         /// Database name (if provider is set)
         #[arg(long)]
         database_name: Option<String>,
+    },
+
+    /// Lazily clone a read-only remote database (copy-on-read; data fetched on first read)
+    Clone {
+        /// Remote source URL, e.g. postgres://user:password@host:5432/dbname
+        #[arg(long = "from")]
+        from: String,
+
+        /// Path where to initialize the clone (default: current directory)
+        path: Option<PathBuf>,
+
+        /// Version for the local database container (e.g. 17). Omit to match the remote's version.
+        #[arg(long)]
+        database_version: Option<String>,
+
+        /// Override the local container image (e.g. pgvector/pgvector:pg16). Use
+        /// when the source relies on an extension the default image lacks; pins
+        /// its own version (overrides --database-version).
+        #[arg(long)]
+        image: Option<String>,
+
+        /// Platform for the local container (e.g. linux/amd64). Use to run an
+        /// image that lacks a manifest for your architecture (via emulation).
+        #[arg(long)]
+        platform: Option<String>,
+
+        /// Host port to bind for the local database container
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// Record a commit of the current repository state
@@ -374,6 +463,12 @@ enum TopLevel {
         action: Option<McpAction>,
     },
 
+    /// Manage the guepard-proxy-v2 daemon (auto-discovers GFS clones by default).
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+
     /// Execute a SQL query or open an interactive database terminal
     Query {
         /// Path to the GFS repository root (default: current directory)
@@ -458,6 +553,7 @@ fn resolve_output_format(cmd_output: Option<String>, json_output: bool) -> Strin
 fn command_name(cmd: &TopLevel) -> &'static str {
     match cmd {
         TopLevel::Init { .. } => "init",
+        TopLevel::Clone { .. } => "clone",
         TopLevel::Commit { .. } => "commit",
         TopLevel::Config { .. } => "config",
         TopLevel::Checkout { .. } => "checkout",
@@ -472,6 +568,7 @@ fn command_name(cmd: &TopLevel) -> &'static str {
         TopLevel::Storage { .. } => "storage",
         TopLevel::Compute { .. } => "compute",
         TopLevel::Mcp { .. } => "mcp",
+        TopLevel::Proxy { .. } => "proxy",
         TopLevel::Version => "version",
     }
 }
@@ -536,6 +633,30 @@ where
                     database_version,
                     port,
                     credentials,
+                    json_output,
+                    None,
+                    None,
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(0)
+            }
+            TopLevel::Clone {
+                from,
+                path,
+                database_version,
+                image,
+                platform,
+                port,
+            } => {
+                commands::cmd_clone::clone(
+                    from,
+                    path,
+                    database_version,
+                    image,
+                    platform,
+                    port,
                     json_output,
                 )
                 .await
@@ -682,6 +803,10 @@ where
             TopLevel::Mcp { path, action } => {
                 let action = action.unwrap_or(McpAction::Stdio);
                 commands::cmd_mcp::run(path, action).await?;
+                Ok(0)
+            }
+            TopLevel::Proxy { action } => {
+                commands::cmd_proxy::run(action).await?;
                 Ok(0)
             }
             TopLevel::Version => {

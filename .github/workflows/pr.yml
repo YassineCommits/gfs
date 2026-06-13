@@ -7,6 +7,11 @@ on:
     branches:
       - main
 
+# Cancel superseded runs when new commits land on the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     environment: pr-validation

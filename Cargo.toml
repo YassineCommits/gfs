@@ -6,12 +6,19 @@ members = [
     "crates/adapters/storage-btrfs",
     "crates/adapters/storage-file",
     "crates/applications/cli",
+    "crates/applications/console",
     "crates/applications/mcp",
+    "crates/applications/proxy",
     "crates/applications/website",
     "crates/config",
     "crates/domain",
     "crates/telemetry",
 ]
+# The gfs Table Access Method extension is a pgrx cdylib with its own
+# panic=unwind profile and pinned toolchain; build it with cargo-pgrx from its
+# own directory (`cd crates/extensions/gfs && cargo pgrx ...`). Excluded so a
+# plain `cargo build` of the workspace never pulls in pgrx.
+exclude = ["crates/extensions/gfs"]
 
 [workspace.package]
 version      = "0.3.2"
@@ -64,6 +71,7 @@ gfs-storage-apfs           = { path = "crates/adapters/storage-apfs" }
 gfs-storage-btrfs          = { path = "crates/adapters/storage-btrfs" }
 gfs-storage-file           = { path = "crates/adapters/storage-file" }
 gfs-compute-docker         = { path = "crates/adapters/compute-docker" }
+gfs-cli                    = { path = "crates/applications/cli" }
 gfs-mcp                    = { path = "crates/applications/mcp" }
 
 [profile.release]

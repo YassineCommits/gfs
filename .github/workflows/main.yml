@@ -5,6 +5,11 @@ on:
     branches:
       - main
 
+# Cancel superseded runs when new commits land on main in quick succession.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest

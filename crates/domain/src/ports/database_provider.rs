@@ -5,7 +5,7 @@
 //! Use [`DatabaseProviderRegistry::register`] to add a provider, and
 //! [`DatabaseProviderRegistry::get`] / [`DatabaseProviderRegistry::list`] to look them up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use crate::ports::compute::ComputeDefinition;
@@ -153,6 +153,41 @@ pub struct SchemaExtractionSpec {
     pub command: String,
 }
 
+// ---------------------------------------------------------------------------
+// Lazy clone (RFC 008)
+// ---------------------------------------------------------------------------
+
+/// A read-only remote database to lazily clone from (copy-on-read).
+///
+/// Only `SELECT` access is assumed; nothing is created on the remote. See
+/// `docs/rfcs/008-remote-clone.md`.
+#[derive(Debug, Clone)]
+pub struct RemoteSource {
+    pub host: String,
+    pub port: u16,
+    pub dbname: String,
+    pub user: String,
+    pub password: String,
+    /// Remote schemas to mirror (e.g. `["public"]`). Empty means "all
+    /// non-system schemas", discovered at bootstrap time.
+    pub schemas: Vec<String>,
+}
+
+/// Sidecar spec that bootstraps a lazy clone inside the local GFS database.
+///
+/// The provider returns a [`ComputeDefinition`] for an ephemeral tool instance
+/// (a database image shipping the client, e.g. `psql`) and a shell command that
+/// connects to the **local** GFS database and sets up the foreign-data-wrapper
+/// link, the mixed-partition tables, and the sync catalog. No data is copied at
+/// bootstrap time — data is hydrated on first read.
+#[derive(Debug, Clone)]
+pub struct CloneSpec {
+    /// Compute definition for the tool sidecar.
+    pub definition: ComputeDefinition,
+    /// Shell command to execute in the sidecar (against the local database).
+    pub command: String,
+}
+
 /// Signal number for graceful shutdown. On Unix, 15 = SIGTERM.
 pub const SIGTERM: u32 = 15;
 
@@ -174,6 +209,42 @@ pub trait DatabaseProvider: Send + Sync {
 
     /// Default arguments for this database provider.
     fn default_args(&self) -> Vec<DatabaseProviderArg>;
+
+    /// Render user-supplied container parameter overrides (from
+    /// `[compute.params]`) into this provider's native argument syntax.
+    ///
+    /// Keys are logical setting names; the provider maps each into its own form
+    /// (e.g. PostgreSQL `-c name=value`, MySQL `--name=value`). The returned
+    /// args are appended *after* [`default_args`](Self::default_args), so for
+    /// engines where the last occurrence wins they override the defaults.
+    ///
+    /// Default: returns nothing (provider does not support overrides).
+    fn render_param_overrides(
+        &self,
+        params: &BTreeMap<String, String>,
+    ) -> Vec<DatabaseProviderArg> {
+        let _ = params;
+        Vec::new()
+    }
+
+    /// [`definition`](Self::definition) with `params` rendered and appended to
+    /// `args`. Provisioning sites use this so container tuning from
+    /// `[compute.params]` is (re-)applied on every init/checkout/restart.
+    fn definition_with_overrides(&self, params: &BTreeMap<String, String>) -> ComputeDefinition {
+        let mut def = self.definition();
+        def.args.extend(
+            self.render_param_overrides(params)
+                .into_iter()
+                .flat_map(|a| {
+                    if a.value.is_empty() {
+                        vec![a.name]
+                    } else {
+                        vec![a.name, a.value]
+                    }
+                }),
+        );
+        def
+    }
 
     /// Default signal sent to the database process when stopping (e.g. for graceful shutdown).
     /// Returns the signal number (e.g. [`SIGTERM`] = 15 on Unix). Default implementation returns SIGTERM.
@@ -361,6 +432,26 @@ pub trait DatabaseProvider: Send + Sync {
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
         Ok(None)
     }
+
+    // -----------------------------------------------------------------------
+    // Lazy clone (RFC 008)
+    // -----------------------------------------------------------------------
+
+    /// Build a sidecar spec that bootstraps a lazy (copy-on-read) clone of a
+    /// read-only `remote` database inside the local GFS database.
+    ///
+    /// `local` carries the connection info the sidecar uses to reach the local
+    /// GFS database. The default implementation reports the feature as
+    /// unsupported.
+    fn clone_bootstrap_spec(
+        &self,
+        _local: &ConnectionParams,
+        _remote: &RemoteSource,
+    ) -> std::result::Result<CloneSpec, ProviderError> {
+        Err(ProviderError::UnsupportedFormat(
+            "lazy clone not supported by this provider".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +540,7 @@ mod tests {
         }
         fn definition(&self) -> ComputeDefinition {
             ComputeDefinition {
+                labels: Default::default(),
                 image: "test:latest".into(),
                 env: vec![],
                 ports: vec![],
@@ -552,6 +644,7 @@ mod tests {
             name: "test".into(),
         };
         let def = ComputeDefinition {
+            labels: Default::default(),
             image: "postgres:16".into(),
             env: vec![],
             ports: vec![],
@@ -564,6 +657,7 @@ mod tests {
         };
         assert_eq!(provider.version_from_image(&def), "16");
         let def_latest = ComputeDefinition {
+            labels: Default::default(),
             image: "postgres".into(),
             env: vec![],
             ports: vec![],
