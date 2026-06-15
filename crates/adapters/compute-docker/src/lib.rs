@@ -29,6 +29,23 @@ use tracing::instrument;
 
 use crate::error::{classify, classify_with_mount_path};
 
+/// Build a task container name that is unique even across `run_task` calls
+/// issued in the same millisecond (e.g. parallel schema extract + export under
+/// `tokio::join!`). A bare millisecond stamp collides when two tasks start in
+/// the same millisecond, and the second `create_container` then fails with
+/// 409 "name already in use". The process id disambiguates concurrent `gfs`
+/// processes; the atomic counter disambiguates concurrent tasks within one.
+fn unique_task_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("gfs-task-{ms}-{}-{seq}", std::process::id())
+}
+
 /// Reject tar paths that could escape `dest` (`..`, absolute components, etc.).
 fn tar_stripped_path_is_safe(stripped: &Path) -> bool {
     if stripped.as_os_str().is_empty() {
@@ -906,13 +923,7 @@ impl Compute for DockerCompute {
         };
 
         // 5. Create the task container with entrypoint overridden to sh -c.
-        let task_name = format!(
-            "gfs-task-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
+        let task_name = unique_task_name();
 
         let config = bollard::models::ContainerCreateBody {
             image: Some(definition.image.clone()),
@@ -1500,6 +1511,26 @@ mod tar_safety_tests {
     fn parent_dir_component_is_unsafe() {
         assert!(!tar_link_target_is_safe(Path::new("../escape")));
         assert!(!tar_link_target_is_safe(Path::new("a/../../b")));
+    }
+}
+
+#[cfg(test)]
+mod task_name_tests {
+    use super::unique_task_name;
+    use std::collections::HashSet;
+
+    #[test]
+    fn names_are_unique_within_same_millisecond() {
+        // A tight loop almost certainly spans a single millisecond, which is
+        // exactly the case that collided under `tokio::join!` before the fix.
+        let names: Vec<String> = (0..10_000).map(|_| unique_task_name()).collect();
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "task names must never collide");
+    }
+
+    #[test]
+    fn names_have_expected_prefix() {
+        assert!(unique_task_name().starts_with("gfs-task-"));
     }
 }
 

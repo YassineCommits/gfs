@@ -128,6 +128,24 @@ fn now_suffix() -> String {
     format!("{}", Utc::now().timestamp_millis())
 }
 
+/// DNS-safe suffix that is unique even across `run_task` calls issued in the
+/// same millisecond (e.g. parallel schema extract + export under
+/// `tokio::join!`). A bare millisecond stamp collides when two tasks start in
+/// the same millisecond, and the second pod create then fails. The process id
+/// disambiguates concurrent `gfs` processes; the atomic counter disambiguates
+/// concurrent tasks within one.
+fn unique_task_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        Utc::now().timestamp_millis(),
+        std::process::id(),
+        seq
+    )
+}
+
 fn ensure_dns_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1129,7 +1147,7 @@ impl Compute for KubernetesCompute {
         linked_to: Option<&InstanceId>,
     ) -> Result<ExecOutput> {
         let pods: Api<Pod> = self.api_pods();
-        let name = ensure_dns_label(&format!("gfs-task-{}", now_suffix()));
+        let name = ensure_dns_label(&format!("gfs-task-{}", unique_task_suffix()));
         let labels = labels_for(&name);
 
         let mut env: Vec<k8s_openapi::api::core::v1::EnvVar> = definition
@@ -1305,6 +1323,26 @@ mod tests {
     use super::*;
     use gfs_domain::ports::compute::EnvVar;
     use k8s_openapi::ByteString;
+
+    #[test]
+    fn unique_task_suffix_never_collides_within_same_millisecond() {
+        use std::collections::HashSet;
+        let suffixes: Vec<String> = (0..10_000).map(|_| unique_task_suffix()).collect();
+        let unique: HashSet<&String> = suffixes.iter().collect();
+        assert_eq!(unique.len(), suffixes.len(), "task suffixes must be unique");
+    }
+
+    #[test]
+    fn unique_task_name_is_a_valid_dns_label() {
+        let name = ensure_dns_label(&format!("gfs-task-{}", unique_task_suffix()));
+        assert!(name.len() <= 63, "name too long for a DNS label: {name}");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "name has invalid DNS-label chars: {name}"
+        );
+        assert!(!name.starts_with('-') && !name.ends_with('-'));
+    }
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {

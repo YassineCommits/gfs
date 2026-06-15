@@ -684,15 +684,8 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     ) -> Result<String, Box<dyn std::error::Error>> {
         tracing::debug!("Extracting schema for commit");
 
-        // 1. Extract schema metadata using ExtractSchemaUseCase.
         let extract_use_case =
             ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
-        let schema_output = extract_use_case.run(repo_path).await.map_err(|e| {
-            tracing::warn!("Schema extraction failed: {}", e);
-            e
-        })?;
-
-        // 2. Export schema DDL using ExportRepoUseCase with "schema" format.
         let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
         let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
             "gfs-schema-{}-{}",
@@ -706,13 +699,27 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                 e
             ))) as Box<dyn std::error::Error>
         })?;
-        let export_output = export_use_case
-            .run(repo_path, Some(temp_dir.clone()), "schema")
-            .await
-            .map_err(|e| {
-                tracing::warn!("Schema DDL export failed: {}", e);
+
+        let export_temp_dir = temp_dir.clone();
+        let extract_schema = async {
+            extract_use_case.run(repo_path).await.map_err(|e| {
+                tracing::warn!("Schema extraction failed: {}", e);
                 e
-            })?;
+            })
+        };
+        let export_schema = async {
+            export_use_case
+                .run(repo_path, Some(export_temp_dir), "schema")
+                .await
+                .map_err(|e| {
+                    tracing::warn!("Schema DDL export failed: {}", e);
+                    e
+                })
+        };
+
+        let (schema_output, export_output) = tokio::join!(extract_schema, export_schema);
+        let schema_output = schema_output?;
+        let export_output = export_output?;
 
         let schema_sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
             tracing::warn!("Failed to read exported schema DDL: {}", e);
