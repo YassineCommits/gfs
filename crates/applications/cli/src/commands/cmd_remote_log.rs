@@ -40,10 +40,7 @@ fn print_log_human(value: &Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("?");
         let short = if hash.len() >= 7 { &hash[..7] } else { hash };
-        let msg = entry
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
         println!("{} {}", cyan(short), dimmed(msg));
     }
 }

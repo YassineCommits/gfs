@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use gfs_console_remote::{auth_from_env, block_direct_kubernetes_env, ConsoleClient};
+use gfs_console_remote::{ConsoleClient, auth_from_env, block_direct_kubernetes_env};
 use gfs_domain::model::config::{
     EnvironmentConfig, GfsConfig, RemoteConfig, RuntimeConfig, UserConfig,
 };
@@ -109,8 +109,24 @@ pub async fn init_remote(
             cyan(target_path.display().to_string()),
             cyan(&database_id)
         );
-        println!("    {:<16} {}", dimmed("Console"), config.remote.as_ref().map(|r| r.console_url.as_str()).unwrap_or(""));
-        println!("    {:<16} {}", dimmed("Node"), config.remote.as_ref().map(|r| r.node_id.as_str()).unwrap_or(""));
+        println!(
+            "    {:<16} {}",
+            dimmed("Console"),
+            config
+                .remote
+                .as_ref()
+                .map(|r| r.console_url.as_str())
+                .unwrap_or("")
+        );
+        println!(
+            "    {:<16} {}",
+            dimmed("Node"),
+            config
+                .remote
+                .as_ref()
+                .map(|r| r.node_id.as_str())
+                .unwrap_or("")
+        );
     }
     Ok(())
 }

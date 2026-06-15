@@ -326,9 +326,7 @@ pub trait DatabaseProvider: Send + Sync {
     /// sessions are not supported; `sql` must be non-empty.
     fn query_in_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
         let _ = sql;
-        Err(ProviderError::UnsupportedFormat(
-            "query_in_instance".into(),
-        ))
+        Err(ProviderError::UnsupportedFormat("query_in_instance".into()))
     }
 
     // -----------------------------------------------------------------------

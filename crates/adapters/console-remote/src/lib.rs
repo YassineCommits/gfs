@@ -222,7 +222,10 @@ fn credentials_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .context("cannot determine home directory")?;
-    Ok(home.join(".config").join("guepard").join("credentials.toml"))
+    Ok(home
+        .join(".config")
+        .join("guepard")
+        .join("credentials.toml"))
 }
 
 pub fn save_credentials(creds: &CredentialsFile) -> Result<()> {
@@ -252,7 +255,9 @@ pub fn auth_from_env() -> Result<ConsoleAuth> {
 
     if let Some(file) = load_credentials_file() {
         if let Some(token) = file.access_token.filter(|t| !t.trim().is_empty()) {
-            return Ok(ConsoleAuth { access_token: token });
+            return Ok(ConsoleAuth {
+                access_token: token,
+            });
         }
     }
 

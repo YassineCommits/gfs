@@ -123,7 +123,10 @@ async fn dispatch_dyn(
 
     match action {
         ComputeAction::Status { .. } => {
-            let status = compute.status(&instance_id).await.map_err(anyhow::Error::from)?;
+            let status = compute
+                .status(&instance_id)
+                .await
+                .map_err(anyhow::Error::from)?;
             // Only Docker compute can report bind-mount host paths; k8s returns None.
             let data_dir: Option<&str> = None;
             if json_output {

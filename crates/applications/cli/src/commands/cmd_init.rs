@@ -40,12 +40,7 @@ pub async fn init(
         .trim()
         .to_ascii_lowercase();
 
-    if remote
-        || matches!(
-            runtime_provider.as_str(),
-            "guepard" | "console" | "remote"
-        )
-    {
+    if remote || matches!(runtime_provider.as_str(), "guepard" | "console" | "remote") {
         return super::cmd_init_remote::init_remote(
             Some(target_path),
             database_provider,

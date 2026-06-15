@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use gfs_console_remote::{auth_from_env, block_direct_kubernetes_env, ConsoleClient};
+use gfs_console_remote::{ConsoleClient, auth_from_env, block_direct_kubernetes_env};
 use gfs_domain::model::config::{GfsConfig, RemoteConfig};
 
 pub fn is_remote_repo(repo_path: &Path) -> Result<bool> {
