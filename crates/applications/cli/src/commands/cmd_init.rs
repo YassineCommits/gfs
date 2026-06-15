@@ -18,6 +18,7 @@ use serde_json::json;
 use crate::cli_utils::get_repo_dir;
 use crate::output::{cyan, dimmed, green};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn init(
     path: Option<PathBuf>,
     database_provider: Option<String>,
@@ -86,15 +87,14 @@ pub async fn init(
 
     // Kubernetes runtime: ensure mount_point is set to PVC name so commits snapshot PVCs
     // instead of trying to snapshot a host filesystem path.
-    if has_provider && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s") {
-        if let Ok(mut cfg) = GfsConfig::load(&target_path) {
-            if cfg.mount_point.as_deref().unwrap_or("").trim().is_empty() {
-                if let Some(rt) = cfg.runtime.as_ref() {
-                    cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
-                    let _ = cfg.save(&target_path);
-                }
-            }
-        }
+    if has_provider
+        && matches!(runtime_provider.as_str(), "kubernetes" | "k8s" | "k3s")
+        && let Ok(mut cfg) = GfsConfig::load(&target_path)
+        && cfg.mount_point.as_deref().unwrap_or("").trim().is_empty()
+        && let Some(rt) = cfg.runtime.as_ref()
+    {
+        cfg.mount_point = Some(format!("{}-data", rt.container_name.trim()));
+        let _ = cfg.save(&target_path);
     }
 
     let mut connection_string: Option<String> = None;

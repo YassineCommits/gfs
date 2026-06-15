@@ -2,18 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use gfs_compute_docker::DockerCompute;
-use gfs_domain::model::config::{GfsConfig, RuntimeConfig};
-use gfs_domain::ports::compute::{
-    Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions, RuntimeDescriptor,
-};
-use gfs_domain::ports::database_provider::{
-    DatabaseProviderRegistry, InMemoryDatabaseProviderRegistry,
-};
-use gfs_domain::repo_utils::repo_layout;
-#[cfg(unix)]
-use gfs_domain::utils::current_user;
-use gfs_domain::utils::data_dir;
+use gfs_domain::model::config::GfsConfig;
+use gfs_domain::ports::compute::{Compute, InstanceId, InstanceState, InstanceStatus, LogsOptions};
 use serde_json::json;
 
 use crate::ComputeAction;
@@ -130,21 +120,21 @@ async fn dispatch_dyn(
             // Only Docker compute can report bind-mount host paths; k8s returns None.
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), None)?;
+                print_status_json(&status, data_dir, path.as_ref(), None)?;
             } else {
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
         ComputeAction::Start { .. } => {
-            let repo_path = path.clone().unwrap_or_else(get_repo_dir);
+            let _repo_path = path.clone().unwrap_or_else(get_repo_dir);
             let status = compute.start(&instance_id, Default::default()).await?;
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("start"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("start"))?;
             } else {
                 println!("{} Compute started", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -165,10 +155,10 @@ async fn dispatch_dyn(
             let status = compute.restart(&instance_id).await?;
             let data_dir: Option<&str> = None;
             if json_output {
-                print_status_json(&status, data_dir.as_deref(), path.as_ref(), Some("restart"))?;
+                print_status_json(&status, data_dir, path.as_ref(), Some("restart"))?;
             } else {
                 println!("{} Compute restarted", green("✓"));
-                print_status(&status, data_dir.as_deref(), path.as_ref());
+                print_status(&status, data_dir, path.as_ref());
             }
         }
 
@@ -399,151 +389,4 @@ fn truncate_id(id: &str) -> String {
     } else {
         format!("{}…", &id[..12])
     }
-}
-
-/// If the container exists and its data bind does not match the active workspace, recreate it
-/// (stop, remove, provision with current active workspace, start, update config). Otherwise start or restart the existing container.
-/// When `restart_if_same` is true (e.g. for `gfs compute restart`), calls restart instead of start when bind matches.
-async fn start_restart_or_recreate(
-    compute: &DockerCompute,
-    instance_id: &InstanceId,
-    repo_path: &std::path::Path,
-    restart_if_same: bool,
-) -> Result<(InstanceId, InstanceStatus)> {
-    let active = match repo_layout::get_active_workspace_data_dir(repo_path) {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same).await,
-    };
-
-    let config = match GfsConfig::load(repo_path) {
-        Ok(c) => c,
-        Err(_) => return just_start_or_restart(compute, instance_id, restart_if_same).await,
-    };
-    let provider_name = match &config.environment {
-        Some(e) if !e.database_provider.is_empty() => e.database_provider.as_str(),
-        _ => return just_start_or_restart(compute, instance_id, restart_if_same).await,
-    };
-
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref())
-        .context("register providers")?;
-    let provider = registry
-        .get(provider_name)
-        .context("unknown database provider")?;
-    let compute_data_path = provider
-        .definition()
-        .data_dir
-        .to_string_lossy()
-        .into_owned();
-
-    let current_bind = match compute
-        .get_instance_data_mount_host_path(instance_id, &compute_data_path)
-        .await
-    {
-        Ok(Some(p)) => p.to_string_lossy().into_owned(),
-        _ => return just_start_or_restart(compute, instance_id, restart_if_same).await,
-    };
-
-    if !paths_differ(&active, &current_bind) {
-        return just_start_or_restart(compute, instance_id, restart_if_same).await;
-    }
-
-    compute.stop(instance_id).await?;
-    compute.remove_instance(instance_id).await?;
-
-    let mut definition = provider.definition();
-    if let Some(ref env) = config.environment
-        && !env.database_version.is_empty()
-    {
-        let base = definition
-            .image
-            .split(':')
-            .next()
-            .unwrap_or(&definition.image);
-        definition.image = format!("{}:{}", base, env.database_version);
-    }
-    data_dir::prepare_for_database_provider(provider.name(), std::path::Path::new(&active))
-        .with_context(|| format!("failed to prepare data dir '{active}'"))?;
-    definition.host_data_dir = Some(std::path::PathBuf::from(&active));
-    #[cfg(unix)]
-    {
-        match current_user::current_user_uid_gid() {
-            Some(uid_gid) => definition.user = Some(uid_gid),
-            None => tracing::warn!(
-                "could not determine host uid:gid; container will run as its default user — \
-                 workspace files may be unreadable by the host user during snapshot"
-            ),
-        }
-    }
-    let new_id = compute.provision(&definition).await?;
-    let status = compute.start(&new_id, Default::default()).await?;
-    let runtime = compute
-        .describe_runtime()
-        .await
-        .unwrap_or(RuntimeDescriptor {
-            provider: "docker".to_string(),
-            version: "24".to_string(),
-        });
-
-    repo_layout::update_runtime_config(
-        repo_path,
-        RuntimeConfig {
-            runtime_provider: runtime.provider,
-            runtime_version: runtime.version,
-            container_name: new_id.0.clone(),
-        },
-    )
-    .context("update runtime config with new container name")?;
-
-    Ok((new_id, status))
-}
-
-async fn just_start_or_restart(
-    compute: &DockerCompute,
-    instance_id: &InstanceId,
-    restart: bool,
-) -> Result<(InstanceId, InstanceStatus)> {
-    let status = if restart {
-        compute.restart(instance_id).await?
-    } else {
-        compute.start(instance_id, Default::default()).await?
-    };
-    Ok((instance_id.clone(), status))
-}
-
-fn paths_differ(a: &str, b: &str) -> bool {
-    let a = std::path::Path::new(a);
-    let b = std::path::Path::new(b);
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a != b,
-        _ => a != b,
-    }
-}
-
-/// Resolve the container's data bind host path from repo config (database provider) and Docker inspect.
-async fn container_data_dir(
-    compute: &DockerCompute,
-    instance_id: &InstanceId,
-    path: Option<PathBuf>,
-) -> Option<String> {
-    let repo_path = path.unwrap_or_else(get_repo_dir);
-    let config = GfsConfig::load(&repo_path).ok()?;
-    let provider_name = config.environment.as_ref()?.database_provider.as_str();
-    if provider_name.is_empty() {
-        return None;
-    }
-    let registry = Arc::new(InMemoryDatabaseProviderRegistry::new());
-    gfs_compute_docker::containers::register_all(registry.as_ref()).ok()?;
-    let provider = registry.get(provider_name)?;
-    let compute_data_path = provider
-        .definition()
-        .data_dir
-        .to_string_lossy()
-        .into_owned();
-    let host_path = compute
-        .get_instance_data_mount_host_path(instance_id, &compute_data_path)
-        .await
-        .ok()?
-        .map(|p| p.to_string_lossy().into_owned())?;
-    Some(host_path)
 }

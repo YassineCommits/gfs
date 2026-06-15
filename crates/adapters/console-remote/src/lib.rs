@@ -228,7 +228,7 @@ fn credentials_path() -> Result<PathBuf> {
         .join("credentials.toml"))
 }
 
-pub fn save_credentials(creds: &CredentialsFile) -> Result<()> {
+pub(crate) fn save_credentials(creds: &CredentialsFile) -> Result<()> {
     let path = credentials_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -245,20 +245,20 @@ fn load_credentials_file() -> Option<CredentialsFile> {
 }
 
 pub fn auth_from_env() -> Result<ConsoleAuth> {
-    if let Ok(token) = std::env::var("GUEPARD_ACCESS_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(ConsoleAuth {
-                access_token: token.trim().to_string(),
-            });
-        }
+    if let Ok(token) = std::env::var("GUEPARD_ACCESS_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(ConsoleAuth {
+            access_token: token.trim().to_string(),
+        });
     }
 
-    if let Some(file) = load_credentials_file() {
-        if let Some(token) = file.access_token.filter(|t| !t.trim().is_empty()) {
-            return Ok(ConsoleAuth {
-                access_token: token,
-            });
-        }
+    if let Some(file) = load_credentials_file()
+        && let Some(token) = file.access_token.filter(|t| !t.trim().is_empty())
+    {
+        return Ok(ConsoleAuth {
+            access_token: token,
+        });
     }
 
     bail!(
