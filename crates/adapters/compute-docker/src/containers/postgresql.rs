@@ -340,6 +340,21 @@ impl DatabaseProvider for PostgresqlProvider {
         })
     }
 
+    fn schema_dump_command(&self, params: &ConnectionParams) -> Result<Option<String>> {
+        let user = params.get_env(ENV_USER).unwrap_or(DEFAULT_USER);
+        let password = params.get_env(ENV_PASSWORD).unwrap_or(DEFAULT_PASSWORD);
+        let db = params.get_env(ENV_DB).unwrap_or(DEFAULT_DB);
+
+        // Same dump as export_spec("schema") but written to stdout (no `-f`), so
+        // it can be captured via Compute::exec inside the running container
+        // instead of a sidecar with a bind-mounted output file.
+        Ok(Some(format!(
+            "PGPASSWORD=\"{password}\" pg_dump -h {host} -p {port} -U {user} -d {db} --format=plain --schema-only",
+            host = params.host,
+            port = params.port,
+        )))
+    }
+
     fn import_spec(
         &self,
         params: &ConnectionParams,
@@ -831,6 +846,32 @@ mod tests {
         assert!(spec.command.contains("-h 172.17.0.2"));
         assert!(spec.command.contains("-U myuser"));
         assert!(spec.command.contains("-d mydb"));
+    }
+
+    #[test]
+    fn schema_dump_command_writes_schema_only_to_stdout() {
+        let provider = PostgresqlProvider::new();
+        let params = ConnectionParams {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            env: vec![
+                ("POSTGRES_USER".into(), "myuser".into()),
+                ("POSTGRES_PASSWORD".into(), "secret".into()),
+                ("POSTGRES_DB".into(), "mydb".into()),
+            ],
+        };
+        let cmd = provider
+            .schema_dump_command(&params)
+            .unwrap()
+            .expect("postgres provides a schema dump command");
+        assert!(cmd.contains("pg_dump"));
+        assert!(cmd.contains("--schema-only"));
+        assert!(cmd.contains("-h 127.0.0.1"));
+        assert!(cmd.contains("-U myuser"));
+        assert!(cmd.contains("-d mydb"));
+        assert!(cmd.contains("PGPASSWORD=\"secret\""));
+        // Must write to stdout (no `-f`) so it can be captured via `exec`.
+        assert!(!cmd.contains("-f "));
     }
 
     #[test]

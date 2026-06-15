@@ -370,6 +370,21 @@ pub trait DatabaseProvider: Send + Sync {
     ) -> std::result::Result<Option<SchemaExtractionSpec>, ProviderError> {
         Ok(None)
     }
+
+    /// Shell command that prints the schema-only DDL to **stdout**, or `None` if
+    /// the provider has no in-container schema dump.
+    ///
+    /// Unlike [`export_spec`](Self::export_spec) — which targets a sidecar with a
+    /// bind-mounted output file for the user-facing `gfs export` — this command is
+    /// run via [`Compute::exec`](crate::ports::compute::Compute::exec) **inside the
+    /// already-running database container** during `gfs commit`. It writes nothing
+    /// to disk and needs no sidecar, so the commit avoids spawning a throwaway
+    /// container just to capture the schema. The caller reads the DDL from stdout.
+    ///
+    /// Default: `None`.
+    fn schema_dump_command(&self, _params: &ConnectionParams) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------

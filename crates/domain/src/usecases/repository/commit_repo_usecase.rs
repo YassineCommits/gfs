@@ -7,14 +7,13 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::model::commit::NewCommit;
-use crate::model::config::GlobalSettings;
+use crate::model::config::{GfsConfig, GlobalSettings};
 use crate::model::layout::GFS_DIR;
 use crate::ports::compute::{Compute, ComputeError, InstanceId, InstanceState};
 use crate::ports::database_provider::{ConnectionParams, DatabaseProviderRegistry};
 use crate::ports::repository::{Repository, RepositoryError};
 use crate::ports::storage::{SnapshotOptions, StorageError, StoragePort, VolumeId};
 use crate::repo_utils::repo_layout;
-use crate::usecases::repository::export_repo_usecase::ExportRepoUseCase;
 use crate::usecases::repository::extract_schema_usecase::ExtractSchemaUseCase;
 use crate::utils::hash::hash_snapshot;
 
@@ -684,49 +683,28 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
     ) -> Result<String, Box<dyn std::error::Error>> {
         tracing::debug!("Extracting schema for commit");
 
+        // Metadata extraction and the DDL dump both run via `exec` inside the
+        // already-running database container — no throwaway sidecars, no image
+        // pulls, no temp files. They are independent, so run them concurrently.
         let extract_use_case =
             ExtractSchemaUseCase::new(self.compute.clone(), self.registry.clone());
-        let export_use_case = ExportRepoUseCase::new(self.compute.clone(), self.registry.clone());
-        let temp_dir = repo_path.join(".gfs").join("tmp").join(format!(
-            "gfs-schema-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(temp_dir.parent().unwrap()).map_err(|e| {
-            tracing::warn!("Failed to create temp directory: {}", e);
-            Box::new(std::io::Error::other(format!(
-                "cannot create temp directory: {}",
-                e
-            ))) as Box<dyn std::error::Error>
-        })?;
-
-        let export_temp_dir = temp_dir.clone();
-        let extract_schema = async {
+        let extract_metadata = async {
             extract_use_case.run(repo_path).await.map_err(|e| {
                 tracing::warn!("Schema extraction failed: {}", e);
                 e
             })
         };
-        let export_schema = async {
-            export_use_case
-                .run(repo_path, Some(export_temp_dir), "schema")
-                .await
-                .map_err(|e| {
-                    tracing::warn!("Schema DDL export failed: {}", e);
-                    e
-                })
+        let dump_ddl = async {
+            self.dump_schema_ddl(repo_path).await.map_err(|e| {
+                tracing::warn!("Schema DDL dump failed: {}", e);
+                e
+            })
         };
 
-        let (schema_output, export_output) = tokio::join!(extract_schema, export_schema);
+        let (schema_output, schema_sql) = tokio::join!(extract_metadata, dump_ddl);
         let schema_output = schema_output?;
-        let export_output = export_output?;
+        let schema_sql = schema_sql.map_err(std::io::Error::other)?;
 
-        let schema_sql = std::fs::read_to_string(&export_output.file_path).map_err(|e| {
-            tracing::warn!("Failed to read exported schema DDL: {}", e);
-            e
-        })?;
-
-        // 3. Store schema object in repo.
         let schema_hash =
             repo_layout::write_schema_object(repo_path, &schema_output.metadata, &schema_sql)
                 .map_err(|e| {
@@ -734,11 +712,70 @@ impl<R: DatabaseProviderRegistry> CommitRepoUseCase<R> {
                     e
                 })?;
 
-        // 4. Cleanup temp directory.
-        let _ = std::fs::remove_dir_all(temp_dir);
-
         tracing::info!("Schema stored with hash: {}", schema_hash);
         Ok(schema_hash)
+    }
+
+    /// Dump the schema-only DDL by running the provider's `schema_dump_command`
+    /// via `exec` inside the running database container. Returns the DDL text
+    /// (empty when the provider declares no dump command). No sidecar, no temp file.
+    ///
+    /// The error type is `String` (not a boxed error) so the future stays `Send`
+    /// when polled concurrently alongside metadata extraction in `tokio::join!`.
+    async fn dump_schema_ddl(&self, repo_path: &std::path::Path) -> Result<String, String> {
+        let config = GfsConfig::load(repo_path).map_err(|e| e.to_string())?;
+        let provider_name = config
+            .environment
+            .as_ref()
+            .map(|e| e.database_provider.clone())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "no database provider configured".to_string())?;
+        let container_name = config
+            .runtime
+            .as_ref()
+            .map(|r| r.container_name.clone())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "no container configured".to_string())?;
+
+        let provider = self
+            .registry
+            .get(&provider_name)
+            .ok_or_else(|| format!("database provider not found: '{provider_name}'"))?;
+
+        let instance_id = InstanceId(container_name);
+        // Connection env (credentials, db name) from the running container; the
+        // command runs *inside* it via `exec`, so it reaches the DB on 127.0.0.1.
+        let conn_info = self
+            .compute
+            .get_task_connection_info(&instance_id, provider.default_port())
+            .await
+            .map_err(|e| e.to_string())?;
+        let params = ConnectionParams {
+            host: "127.0.0.1".to_string(),
+            port: conn_info.port,
+            env: conn_info.env,
+        };
+
+        let Some(command) = provider
+            .schema_dump_command(&params)
+            .map_err(|e| e.to_string())?
+        else {
+            // Provider declares no schema dump (e.g. mysql/clickhouse): metadata only.
+            return Ok(String::new());
+        };
+
+        let output = self
+            .compute
+            .exec(&instance_id, &command, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        if output.exit_code != 0 {
+            return Err(format!(
+                "schema dump command failed (exit {}): {}",
+                output.exit_code, output.stderr
+            ));
+        }
+        Ok(output.stdout)
     }
 }
 
