@@ -381,7 +381,7 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-        }
+            }
         }
         fn default_port(&self) -> u16 {
             5432
@@ -478,6 +478,7 @@ mod tests {
             environment: Some(env.clone()),
             runtime: Some(runtime.clone()),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir).unwrap();
@@ -552,6 +553,7 @@ mod tests {
                 container_name: "c1".into(),
             }),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir.path()).unwrap();
@@ -586,6 +588,7 @@ mod tests {
                 container_name: "".into(),
             }),
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(dir.path()).unwrap();

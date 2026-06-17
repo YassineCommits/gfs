@@ -364,6 +364,7 @@ mod tests {
             environment: env,
             runtime,
             storage: None,
+            compute: None,
             remote: None,
         };
         config.save(path).expect("save config");
@@ -965,6 +966,7 @@ GFS_SCHEMA_COLUMNS
         let provider = MockSchemaProvider {
             schema_spec: Some(SchemaExtractionSpec {
                 definition: ComputeDefinition {
+                    labels: Default::default(),
                     image: "postgres:latest".into(),
                     env: vec![],
                     ports: vec![],

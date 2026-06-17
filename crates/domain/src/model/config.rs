@@ -137,8 +137,7 @@ impl GfsConfig {
             .as_ref()
             .map(|r| r.runtime_provider.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        matches!(provider.as_str(), "guepard" | "console" | "remote")
-            && self.remote.is_some()
+        matches!(provider.as_str(), "guepard" | "console" | "remote") && self.remote.is_some()
     }
 
     pub fn load(repo_path: &Path) -> Result<Self, RepoError> {
@@ -268,6 +267,7 @@ mod tests {
                 compression: Some("zstd".into()),
                 enable_reflink: true,
             }),
+            compute: None,
             remote: None,
         };
         config.save(dir.path()).unwrap();
@@ -331,6 +331,7 @@ mod tests {
             runtime: None,
             storage: None,
             compute: Some(ComputeConfig { params }),
+            remote: None,
         };
         config.save(dir.path()).unwrap();
 
@@ -352,6 +353,7 @@ mod tests {
                 runtime: None,
                 storage: None,
                 compute: None,
+                remote: None,
             }
             .compute_params()
             .is_empty()
@@ -369,6 +371,7 @@ mod tests {
             environment: None,
             runtime: None,
             storage: None,
+            compute: None,
             remote: None,
         };
         // Pass path where .gfs does not exist; save writes to repo_path/.gfs/config.toml
