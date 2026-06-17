@@ -1294,6 +1294,7 @@ mod tests {
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {
+            labels: Default::default(),
             image: "postgres:17".into(),
             env,
             ports: vec![],
