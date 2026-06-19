@@ -12,8 +12,12 @@ use gfs_domain::ports::database_provider::{
 
 const NAME: &str = "postgres";
 
-/// Default PostgreSQL image (official image, current LTS-alpine).
-const DEFAULT_IMAGE: &str = "gfs-postgres:16";
+/// Default PostgreSQL image. The tag here is only a fallback base — every
+/// provisioning and sidecar-task site re-tags it with the repository's
+/// configured `database_version` (see `task_image_for_version`, deploy, and
+/// checkout), so the effective image follows the user's chosen PG version,
+/// defaulting to the supported `17`.
+const DEFAULT_IMAGE: &str = "gfs-postgres:17";
 
 /// Path inside the container where PostgreSQL stores data (PGDATA).
 const CONTAINER_DATA_DIR: &str = "/var/lib/postgresql/data";
@@ -183,6 +187,16 @@ fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeD
         logs_dir: None,
         conf_dir: None,
         args: vec![],
+    }
+}
+
+impl PostgresqlProvider {
+    /// Single-line `psql -c` for k8s exec (stdin=false); heredocs hang there.
+    fn psql_inline_instance_command(&self, sql: &str) -> std::result::Result<String, ProviderError> {
+        let escaped = sql.replace('\\', "\\\\").replace('"', "\\\"");
+        Ok(format!(
+            r#"PGPASSWORD="${{POSTGRES_PASSWORD:-postgres}}" psql -h 127.0.0.1 -U "${{POSTGRES_USER:-postgres}}" -d "${{POSTGRES_DB:-postgres}}" -v ON_ERROR_STOP=1 -c "{escaped}""#
+        ))
     }
 }
 
@@ -519,6 +533,24 @@ impl DatabaseProvider for PostgresqlProvider {
         })
     }
 
+    fn supports_lazy_clone(&self) -> bool {
+        true
+    }
+
+    fn lazy_clone_detach_in_instance_commands(
+        &self,
+    ) -> std::result::Result<Vec<String>, ProviderError> {
+        const DETACH: &[&str] = &[
+            "DROP SERVER IF EXISTS gfs_remote_srv CASCADE",
+            "UPDATE gfs.clone_source SET whole_cached = true, no_partial = true \
+             WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'gfs')",
+        ];
+        DETACH
+            .iter()
+            .map(|sql| self.psql_inline_instance_command(sql))
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Query / Interactive Terminal
     // -----------------------------------------------------------------------
@@ -726,9 +758,6 @@ pub fn register(registry: &impl DatabaseProviderRegistry) -> Result<()> {
 /// highlighting / linting). `__PLACEHOLDER__` sentinels are substituted by
 /// `build_clone_bootstrap_sql`.
 const CLONE_BOOTSTRAP_TMPL: &str = include_str!("clone_bootstrap.sql");
-
-/// SQL run after a snapshot-seeded clone when `fetch_remote_source=false`.
-pub const LAZY_CLONE_DETACH_REMOTE_SQL: &str = include_str!("detach_remote.sql");
 
 /// Escape a value for use inside a single-quoted SQL string literal.
 fn sql_lit(s: &str) -> String {

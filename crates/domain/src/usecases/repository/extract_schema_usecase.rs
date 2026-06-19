@@ -157,7 +157,9 @@ impl<R: DatabaseProviderRegistry> ExtractSchemaUseCase<R> {
         // 5. Run the command via `exec` inside the running database container
         //    instead of spawning a throwaway sidecar. The DB image already ships
         //    the client tools the command needs (psql, pg_dump), so no separate
-        //    container, image pull, or network linking is required.
+        //    container, image pull, or network linking is required. The
+        //    task-image-versioning retag from `main` applied only to the sidecar
+        //    image, which `exec` no longer creates, so it is intentionally dropped.
         let output = self.compute.exec(&instance_id, &spec.command, None).await?;
 
         if output.exit_code != 0 {
