@@ -11,7 +11,7 @@ use crate::base_plan;
 use crate::catalog::{
     bump_access, gfs_enqueue_copy, gfs_enqueue_partial, gfs_is_covered, gfs_lookup_clone,
     gfs_note_pred_seen, gfs_pred_count, gfs_pred_state, gfs_set_no_partial, gfs_throttle,
-    gfs_time_queued, gfs_whole_queued,
+    gfs_time_queued, gfs_whole_queued, relation_has_tombstones,
 };
 use crate::federate::swap_clone_rtes_to_foreign;
 use crate::hydrate::do_hydrate;
@@ -66,7 +66,22 @@ pub(crate) unsafe fn gfs_route(
     // e.g. an exotic shape): own those tables whole — NEVER serve a local
     // incomplete result.
     if !ctx.federate_targets.is_empty() {
-        if !is_write && !parse_copy.is_null() && swap_clone_rtes_to_foreign(parse_copy) > 0 {
+        // A federated swap runs the query at the SOURCE over the foreign tables, which
+        // cannot see local DELETE tombstones -> a row deleted on the clone would
+        // reappear in the result. If any target table has tombstones, do NOT swap;
+        // fall through to the tombstone-aware whole-own hydration below (do_hydrate
+        // excludes tombstoned rows), so local deletes are honored on the federate path.
+        // (Optimization TODO: inject a `NOT EXISTS gfs.tombstone` anti-join into the
+        // federated query instead of owning the table whole.)
+        let any_tombstoned = ctx
+            .federate_targets
+            .iter()
+            .any(|t| unsafe { relation_has_tombstones(t.relid) });
+        if !is_write
+            && !any_tombstoned
+            && !parse_copy.is_null()
+            && swap_clone_rtes_to_foreign(parse_copy) > 0
+        {
             gfs_throttle(); // rate-limit source contact (the federated query hits prod)
             return base_plan(parse_copy, qs, cursor, params);
         }

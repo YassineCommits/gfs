@@ -16,6 +16,34 @@ pub(crate) unsafe fn spi_text(p: *mut c_char) -> Option<String> {
     }
 }
 
+/// True iff this clone table has any copy-on-write DELETE tombstones. A federated
+/// swap runs the query at the SOURCE over the foreign tables, which cannot see the
+/// local `gfs.tombstone` table, so a row deleted on the clone would reappear in the
+/// result. The router therefore must NOT federate a table that has tombstones; it
+/// falls back to a tombstone-aware whole-own hydration instead (do_hydrate excludes
+/// them). Zero-cost lookup; the no-deletes case (the norm) returns false at once.
+pub(crate) unsafe fn relation_has_tombstones(relid: pg_sys::Oid) -> bool {
+    if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
+        return false;
+    }
+    let q = CString::new(format!(
+        "SELECT EXISTS(SELECT 1 FROM gfs.tombstone WHERE relid::oid = {})::int::text",
+        u32::from(relid)
+    ))
+    .unwrap();
+    let mut has = false;
+    if pg_sys::SPI_execute(q.as_ptr(), true, 1) == pg_sys::SPI_OK_SELECT as i32
+        && pg_sys::SPI_processed == 1
+    {
+        let tt = pg_sys::SPI_tuptable;
+        let row = *(*tt).vals;
+        let td = (*tt).tupdesc;
+        has = spi_text(pg_sys::SPI_getvalue(row, td, 1)).as_deref() == Some("1");
+    }
+    pg_sys::SPI_finish();
+    has
+}
+
 pub(crate) unsafe fn gfs_lookup_clone(relid: pg_sys::Oid) -> Option<CloneInfo> {
     if pg_sys::SPI_connect() != pg_sys::SPI_OK_CONNECT as i32 {
         return None;
