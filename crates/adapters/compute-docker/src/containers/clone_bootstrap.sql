@@ -242,6 +242,51 @@ BEGIN
 END
 $fn$;
 
+-- Replicate each local sequence's CURRENT POSITION from the source. The faithful
+-- schema replay (`pg_dump --schema-only`) emits `CREATE SEQUENCE` but NOT the
+-- sequence position (`setval` lives in pg_dump's data section, which a schema-only
+-- dump omits), so every local sequence restarts at its initial value (typically 1).
+-- A source serial/identity/standalone sequence advanced past its start would then
+-- hand out values that COLLIDE with rows already materialized on the clone. For
+-- each local sequence (relkind='S' — catches serial-owned, identity-owned, and
+-- standalone sequences) we read the matching source sequence's `last_value` and
+-- `is_called` straight off the sequence relation via dblink (NOT pg_sequences,
+-- whose last_value is NULL/permission-sensitive) and setval() the local one to
+-- match. Per-sequence failures warn loudly rather than abort: a clone with one
+-- un-synced sequence is recoverable; an aborted clone is not. A sequence absent on
+-- the source (local-only) is simply skipped.
+CREATE OR REPLACE FUNCTION gfs_sync.replicate_sequences(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  seqrec record;
+  src    record;
+  fq     text;
+BEGIN
+  FOR seqrec IN
+    SELECT n.nspname::text AS nsp, c.relname::text AS seq
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S' AND n.nspname = ANY (p_schemas)
+  LOOP
+    fq := format('%I.%I', seqrec.nsp, seqrec.seq);
+    BEGIN
+      -- Read the source sequence's current state directly off the relation. A
+      -- regclass cast on the source guards a sequence that exists locally but not
+      -- remotely: dblink raises, we catch and skip below.
+      SELECT * INTO src FROM dblink(p_conn, format(
+          'SELECT last_value, is_called FROM %s', fq))
+        AS r(last_value bigint, is_called boolean);
+      IF src.last_value IS NOT NULL THEN
+        PERFORM setval(fq::regclass, src.last_value, src.is_called);
+      END IF;
+    EXCEPTION WHEN others THEN
+      RAISE WARNING 'gfs: could not replicate sequence value for % (%): inserts on the clone may collide with materialized rows', fq, SQLERRM;
+    END;
+  END LOOP;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])
 RETURNS void
 LANGUAGE plpgsql AS $fn$
@@ -292,6 +337,12 @@ BEGIN
     -- aborted.
     PERFORM gfs_sync.build_clone(rec.nsp, rec.tab, rec.keycols);
   END LOOP;
+
+  -- Inherit each local sequence's current position from the source so the clone
+  -- does not restart serial/identity/standalone sequences at 1 and collide with
+  -- already-materialized rows. Runs after the tables (and their owned sequences)
+  -- exist from the faithful replay.
+  PERFORM gfs_sync.replicate_sequences(p_conn, target_schemas);
 END
 $fn$;
 
