@@ -287,6 +287,63 @@ BEGIN
 END
 $fn$;
 
+-- Safeguard: a partitioned table must NEVER be silently dropped from the clone.
+-- A partitioned PARENT (relkind='p') holds no rows and is skipped by the table
+-- enumeration and the copy-on-read registration (both relkind='r'); it needs no
+-- registration of its own because the faithful replay re-creates it and a query on
+-- the parent prunes to its leaf partitions. Each LEAF partition (relkind='r') is an
+-- ordinary table that the relkind='r' path above imports and registers like any
+-- other table — that is how copy-on-read is wired for partitions. The risk is a
+-- leaf that does NOT round-trip: it has no usable unique key (so the keycol query
+-- skips it), or it failed to import / replay. The current code would leave that
+-- leaf as an empty, unregistered local heap and the clone would silently return no
+-- rows for that slice of the partitioned table. This function enumerates the
+-- SOURCE's partitioned tables and their leaf partitions (pg_partition_tree, so it
+-- also covers multi-level subpartitions), then asserts every leaf is locally
+-- present AND registered as a copy-on-read clone. Any gap RAISEs (fatal under
+-- ON_ERROR_STOP) naming the offending partitioned table, so a partitioned table is
+-- never silently dropped — it either round-trips fully or fails the clone loudly.
+CREATE OR REPLACE FUNCTION gfs_sync.verify_partitions(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  schlist  text;
+  leaf     record;
+  leaf_fq  text;
+  problems text[] := ARRAY[]::text[];
+BEGIN
+  schlist := (SELECT string_agg(quote_literal(x), ', ') FROM unnest(p_schemas) AS x);
+
+  FOR leaf IN SELECT * FROM dblink(p_conn, format($q$
+      SELECT pn.nspname::text AS parent_nsp, pc.relname::text AS parent_tab,
+             ln.nspname::text AS leaf_nsp,   lc.relname::text AS leaf_tab
+      FROM pg_class pc
+      JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+      CROSS JOIN LATERAL pg_partition_tree(pc.oid) pt
+      JOIN pg_class lc     ON lc.oid = pt.relid AND pt.isleaf
+      JOIN pg_namespace ln ON ln.oid = lc.relnamespace
+      WHERE pc.relkind = 'p' AND pn.nspname IN (%s)
+    $q$, schlist)) AS r(parent_nsp text, parent_tab text, leaf_nsp text, leaf_tab text)
+  LOOP
+    leaf_fq := format('%I.%I', leaf.leaf_nsp, leaf.leaf_tab);
+    IF to_regclass(leaf_fq) IS NULL THEN
+      problems := problems || format('%I.%I (partition %s missing locally)',
+                    leaf.parent_nsp, leaf.parent_tab, leaf_fq);
+    ELSIF NOT EXISTS (
+      SELECT 1 FROM gfs.clone_source WHERE relid = leaf_fq::regclass
+    ) THEN
+      problems := problems || format('%I.%I (partition %s not registered for copy-on-read; it likely lacks a usable unique key)',
+                    leaf.parent_nsp, leaf.parent_tab, leaf_fq);
+    END IF;
+  END LOOP;
+
+  IF array_length(problems, 1) > 0 THEN
+    RAISE EXCEPTION 'gfs: partitioned table(s) did not fully round-trip onto the clone: %. Refusing to leave them silently empty.',
+      array_to_string(problems, '; ');
+  END IF;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])
 RETURNS void
 LANGUAGE plpgsql AS $fn$
@@ -343,6 +400,11 @@ BEGIN
   -- already-materialized rows. Runs after the tables (and their owned sequences)
   -- exist from the faithful replay.
   PERFORM gfs_sync.replicate_sequences(p_conn, target_schemas);
+
+  -- Fail loudly if any partitioned table did not fully round-trip (a leaf missing
+  -- locally or not registered for copy-on-read), so a partitioned table is never
+  -- silently dropped from the clone. Runs last, after every table is registered.
+  PERFORM gfs_sync.verify_partitions(p_conn, target_schemas);
 END
 $fn$;
 
