@@ -344,6 +344,73 @@ BEGIN
 END
 $fn$;
 
+-- Bug B safeguard: a source table with no usable unique key is skipped by the keycol
+-- query in clone() (it needs a unique, non-partial, non-expression index), so it is
+-- never registered for copy-on-read and would be a SILENT empty heap on the clone
+-- (data loss, no error). Assert every ordinary (non-partition) source table is locally
+-- present AND registered; any gap RAISEs (fatal under ON_ERROR_STOP), naming the table.
+-- Leaf partitions are covered by verify_partitions. NOTE: until keyless whole-table
+-- hydration lands in the gfs extension, a primary-key-less table fails the clone loudly
+-- here rather than silently losing its rows.
+CREATE OR REPLACE FUNCTION gfs_sync.verify_tables_registered(p_conn text, p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  schlist  text;
+  t        record;
+  fq       text;
+  problems text[] := ARRAY[]::text[];
+BEGIN
+  schlist := (SELECT string_agg(quote_literal(x), ', ') FROM unnest(p_schemas) AS x);
+  FOR t IN SELECT * FROM dblink(p_conn, format($q$
+      SELECT n.nspname::text AS nsp, c.relname::text AS tab
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r' AND NOT c.relispartition AND n.nspname IN (%s)
+    $q$, schlist)) AS r(nsp text, tab text)
+  LOOP
+    fq := format('%I.%I', t.nsp, t.tab);
+    IF to_regclass(fq) IS NULL THEN
+      problems := problems || format('%s (missing locally)', fq);
+    ELSIF NOT EXISTS (SELECT 1 FROM gfs.clone_source WHERE relid = fq::regclass) THEN
+      problems := problems || format('%s (no usable unique key -> not registered for copy-on-read; would silently return no rows)', fq);
+    END IF;
+  END LOOP;
+  IF array_length(problems, 1) > 0 THEN
+    RAISE EXCEPTION 'gfs: source table(s) did not register for copy-on-read onto the clone: %. Refusing to leave them silently empty.',
+      array_to_string(problems, '; ');
+  END IF;
+END
+$fn$;
+
+-- Bug C: the faithful pg_dump replay re-creates materialized views but leaves them
+-- unpopulated, so reading one errors "has not been populated". Refresh each local
+-- matview now that its base tables are registered for copy-on-read (the refresh reads
+-- the base tables, hydrating them). Two passes so a matview defined over another matview
+-- can still populate; a final failure warns rather than aborting the clone.
+CREATE OR REPLACE FUNCTION gfs_sync.refresh_matviews(p_schemas text[])
+RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  mv   record;
+  pass int;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    FOR mv IN
+      SELECT schemaname, matviewname FROM pg_matviews
+      WHERE schemaname = ANY(p_schemas) AND NOT ispopulated
+    LOOP
+      BEGIN
+        EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I', mv.schemaname, mv.matviewname);
+      EXCEPTION WHEN OTHERS THEN
+        IF pass = 2 THEN
+          RAISE WARNING 'gfs: could not populate materialized view %.%: %', mv.schemaname, mv.matviewname, SQLERRM;
+        END IF;
+      END;
+    END LOOP;
+  END LOOP;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION gfs_sync.clone(p_conn text, p_schemas text[])
 RETURNS void
 LANGUAGE plpgsql AS $fn$
@@ -401,10 +468,18 @@ BEGIN
   -- exist from the faithful replay.
   PERFORM gfs_sync.replicate_sequences(p_conn, target_schemas);
 
+  -- Bug B safeguard: every ordinary source table must register for copy-on-read; a
+  -- table with no usable unique key would otherwise be a silent empty heap. Fail loud.
+  PERFORM gfs_sync.verify_tables_registered(p_conn, target_schemas);
+
   -- Fail loudly if any partitioned table did not fully round-trip (a leaf missing
   -- locally or not registered for copy-on-read), so a partitioned table is never
   -- silently dropped from the clone. Runs last, after every table is registered.
   PERFORM gfs_sync.verify_partitions(p_conn, target_schemas);
+
+  -- Bug C: populate materialized views (created empty by the faithful replay) now that
+  -- their base tables are registered for copy-on-read.
+  PERFORM gfs_sync.refresh_matviews(target_schemas);
 END
 $fn$;
 
