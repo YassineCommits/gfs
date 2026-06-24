@@ -392,14 +392,34 @@ RETURNS void
 LANGUAGE plpgsql AS $fn$
 DECLARE
   mv   record;
+  base record;
   pass int;
 BEGIN
   FOR pass IN 1..2 LOOP
     FOR mv IN
-      SELECT schemaname, matviewname FROM pg_matviews
+      SELECT schemaname, matviewname,
+             format('%I.%I', schemaname, matviewname)::regclass AS oid
+      FROM pg_matviews
       WHERE schemaname = ANY(p_schemas) AND NOT ispopulated
     LOOP
       BEGIN
+        -- A matview on a lazy clone reads copy-on-read base tables that are not yet
+        -- materialized at bootstrap, so a bare REFRESH populates it from ZERO rows
+        -- (ispopulated=t but empty -- silently wrong). Fully materialize every
+        -- registered clone table this matview depends on (gfs.warm = committed FDW
+        -- copy; covers direct bases AND partition leaves) BEFORE the REFRESH so it
+        -- computes over real data.
+        FOR base IN
+          SELECT DISTINCT cs.relid::regclass AS rel
+          FROM pg_depend d
+          JOIN pg_rewrite rw ON rw.oid = d.objid AND rw.ev_class = mv.oid
+          JOIN gfs.clone_source cs
+            ON cs.relid = d.refobjid
+            OR cs.relid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent = d.refobjid)
+          WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid <> mv.oid
+        LOOP
+          PERFORM gfs.warm(base.rel);
+        END LOOP;
         EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I', mv.schemaname, mv.matviewname);
       EXCEPTION WHEN OTHERS THEN
         IF pass = 2 THEN
