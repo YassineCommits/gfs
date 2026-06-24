@@ -240,11 +240,10 @@ impl<R: DatabaseProviderRegistry> ImportRepoUseCase<R> {
         spec.definition.host_data_dir = Some(staging_dir.clone());
         // Channel the sidecar image to the database's configured version rather
         // than the provider's hardcoded default tag.
-        spec.definition.image =
-            crate::usecases::repository::task_image::task_image_for_version(
-                &spec.definition.image,
-                &config,
-            );
+        spec.definition.image = crate::usecases::repository::task_image::task_image_for_version(
+            &spec.definition.image,
+            &config,
+        );
 
         // 6. Run the import sidecar linked to the database instance.
         let output = self
@@ -489,7 +488,7 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-        }
+            }
         }
         fn default_port(&self) -> u16 {
             5432
@@ -600,6 +599,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -629,6 +629,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -656,6 +657,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),
@@ -681,6 +683,7 @@ mod tests {
             database_provider: "postgres".into(),
             database_version: "17".into(),
             database_port: None,
+            display_name: None,
         };
         let runtime = RuntimeConfig {
             runtime_provider: "docker".into(),

@@ -711,6 +711,9 @@ impl Compute for DockerCompute {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: true,
             supports_exec_as_root: true,
+            // Docker `pause()` freezes the container/database, so schema
+            // extraction must run strictly before the snapshot.
+            db_live_during_snapshot: false,
         })
     }
 
@@ -1404,7 +1407,12 @@ impl DockerCompute {
         cmd: &str,
         user: Option<&str>,
     ) -> Result<ExecOutput> {
-        const MAX_CAPTURE_BYTES: usize = 256 * 1024; // per-stream cap
+        // Per-stream capture ceiling. Sized to hold large schema-extraction output
+        // (metadata JSON + `pg_dump` DDL for big databases, run via `exec` during
+        // commit), not just the tiny CHECKPOINT/probe output this was originally
+        // written for. Output beyond this is truncated with a marker rather than
+        // buffered unbounded.
+        const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
         let opts = bollard::exec::CreateExecOptions {
             cmd: Some(vec!["sh".into(), "-c".into(), cmd.to_string()]),

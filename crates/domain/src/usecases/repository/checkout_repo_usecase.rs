@@ -319,6 +319,7 @@ impl<R: DatabaseProviderRegistry> CheckoutRepoUseCase<R> {
             .unwrap_or(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             });
         // Startup probes are connectivity checks (pg_isready, mysqladmin ping) that do
         // not require root. When exec-as-root is unavailable, run as the container's
@@ -1190,6 +1191,7 @@ mod tests {
                 database_provider: "postgres".into(),
                 database_version: "17".into(),
                 database_port: None,
+                display_name: None,
             }))
         }
         async fn get_user_config(
@@ -1280,6 +1282,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: true,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(
@@ -1566,6 +1569,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(
@@ -1713,6 +1717,7 @@ mod tests {
             Ok(ComputeCapabilities {
                 supports_stream_snapshot: false,
                 supports_exec_as_root: false,
+                db_live_during_snapshot: false,
             })
         }
         async fn exec(

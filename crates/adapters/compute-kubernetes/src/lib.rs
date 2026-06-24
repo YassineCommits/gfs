@@ -147,12 +147,14 @@ fn task_container_exit_code(pod: &Pod) -> Option<i32> {
 
 async fn fetch_task_pod_logs(pods: &kube::Api<Pod>, name: &str) -> String {
     for previous in [false, true] {
-        let mut lp = kube::api::LogParams::default();
-        lp.previous = previous;
-        if let Ok(logs) = pods.logs(name, &lp).await {
-            if !logs.is_empty() {
-                return logs;
-            }
+        let lp = kube::api::LogParams {
+            previous,
+            ..Default::default()
+        };
+        if let Ok(logs) = pods.logs(name, &lp).await
+            && !logs.is_empty()
+        {
+            return logs;
         }
     }
     String::new()
@@ -670,6 +672,22 @@ impl KubernetesCompute {
                 exit_code: None,
             };
         };
+        // A pod scaled to zero (replicas=0) keeps phase=Running throughout its
+        // termination grace period. Surface a pod that is being deleted as
+        // Stopping, not Running, so callers don't mistake a terminating pod for a
+        // live instance — this is what lets the data-plane auto-resume re-scale a
+        // db whose previous op just re-paused it, instead of skipping the wake
+        // (which left replicas=0 and hung the next op waiting for a pod that
+        // would never be created).
+        if pod.metadata.deletion_timestamp.is_some() {
+            return InstanceStatus {
+                id: instance.clone(),
+                state: InstanceState::Stopping,
+                pid: None,
+                started_at: None,
+                exit_code: None,
+            };
+        }
         let phase = pod
             .status
             .as_ref()
@@ -1008,6 +1026,10 @@ impl Compute for KubernetesCompute {
         Ok(ComputeCapabilities {
             supports_stream_snapshot: false,
             supports_exec_as_root: false,
+            // Kubernetes `pause()` is a structural no-op (`PauseUnsupported`):
+            // the database stays live during the PVC snapshot, so read-only
+            // schema extraction can safely overlap it.
+            db_live_during_snapshot: true,
         })
     }
 
@@ -1041,8 +1063,15 @@ impl Compute for KubernetesCompute {
                     Ok(a) => break a,
                     Err(e) if attempt < 5 => {
                         attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        tracing::debug!("k8s exec upgrade retry {attempt}/5: {e}");
+                        // Exponential backoff (200ms, 400ms, 800ms, …) instead of a
+                        // flat 2s. The upgrade rejection right after a pod reports
+                        // Ready is almost always transient and clears in well under
+                        // a second, so a short first retry avoids adding a fixed ~2s
+                        // tail to the common case while still backing off if the
+                        // failure genuinely persists.
+                        let backoff = std::time::Duration::from_millis(200u64 << (attempt - 1));
+                        tokio::time::sleep(backoff).await;
+                        tracing::debug!("k8s exec upgrade retry {attempt}/5 in {backoff:?}: {e}");
                     }
                     Err(e) => {
                         return Err(ComputeError::Internal(format!("k8s exec failed: {e}")));
@@ -1309,6 +1338,7 @@ mod tests {
 
     fn definition_with_env(env: Vec<EnvVar>) -> ComputeDefinition {
         ComputeDefinition {
+            labels: Default::default(),
             image: "postgres:17".into(),
             env,
             ports: vec![],
