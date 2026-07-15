@@ -72,7 +72,8 @@ impl ClickhouseProvider {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        }
+            tls: None,
+}
     }
 
     fn user(params: &ConnectionParams) -> &str {
@@ -295,7 +296,8 @@ done"#,
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            },
+                tls: None,
+},
             command,
             output_filename: "schema.sql".into(),
         })
@@ -439,7 +441,8 @@ fi"#,
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            },
+                tls: None,
+},
             command,
             input_filename: input_filename.to_string(),
         })
@@ -640,7 +643,8 @@ COLUMNS_EOF
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            },
+                tls: None,
+},
             command,
         }))
     }

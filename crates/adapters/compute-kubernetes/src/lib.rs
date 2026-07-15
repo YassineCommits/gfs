@@ -392,13 +392,13 @@ impl KubernetesCompute {
             })
             .collect();
 
-        let mounts = vec![VolumeMount {
+        let mut mounts = vec![VolumeMount {
             name: "data".to_string(),
             mount_path: def.data_dir.to_string_lossy().into_owned(),
             ..Default::default()
         }];
 
-        let volumes = vec![Volume {
+        let mut volumes = vec![Volume {
             name: "data".to_string(),
             persistent_volume_claim: Some(
                 k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
@@ -408,6 +408,57 @@ impl KubernetesCompute {
             ),
             ..Default::default()
         }];
+
+        let mut init_containers: Vec<Container> = Vec::new();
+        if let Some(ref tls) = def.tls {
+            let container_tls = tls.container_dir.to_string_lossy().into_owned();
+            let host_tls = tls.host_dir.to_string_lossy().into_owned();
+            mounts.push(VolumeMount {
+                name: "tls".to_string(),
+                mount_path: container_tls.clone(),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "tls-src".to_string(),
+                host_path: Some(k8s_openapi::api::core::v1::HostPathVolumeSource {
+                    path: host_tls,
+                    type_: Some("Directory".into()),
+                }),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "tls".to_string(),
+                empty_dir: Some(Default::default()),
+                ..Default::default()
+            });
+            // Postgres rejects world/group-readable keys; copy + chown to uid 999.
+            init_containers.push(Container {
+                name: "tls-perms".to_string(),
+                image: Some("busybox:1.36".into()),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                command: Some(vec!["sh".into(), "-c".into()]),
+                args: Some(vec![format!(
+                    "cp /tls-src/server.crt /tls-src/server.key /tls-dst/ && \
+                     chown 999:999 /tls-dst/server.crt /tls-dst/server.key && \
+                     chmod 600 /tls-dst/server.key && chmod 644 /tls-dst/server.crt && \
+                     if [ -f /tls-src/ca.pem ]; then cp /tls-src/ca.pem /tls-dst/ && chown 999:999 /tls-dst/ca.pem && chmod 644 /tls-dst/ca.pem; fi"
+                )]),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "tls-src".into(),
+                        mount_path: "/tls-src".into(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "tls".into(),
+                        mount_path: "/tls-dst".into(),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            });
+        }
 
         let container = Container {
             name: "db".to_string(),
@@ -447,6 +498,11 @@ impl KubernetesCompute {
                         // Lazy-clone dblink/pg_dump reach external hosts; k3s CoreDNS
                         // is often broken on agents — use the node's resolver.
                         dns_policy: Some("Default".to_string()),
+                        init_containers: if init_containers.is_empty() {
+                            None
+                        } else {
+                            Some(init_containers)
+                        },
                         containers: vec![container],
                         volumes: Some(volumes),
                         node_selector: k8s_schedule_node_name()
@@ -1318,7 +1374,8 @@ mod tests {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        }
+            tls: None,
+}
     }
 
     fn env_var(name: &str, default: Option<&str>) -> EnvVar {

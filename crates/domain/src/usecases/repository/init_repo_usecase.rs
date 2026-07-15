@@ -83,6 +83,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         display_name: Option<String>,
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
+        tls: Option<crate::ports::compute::ComputeTlsMount>,
     ) -> std::result::Result<(), InitRepoError> {
         self.repository.init(&path, mount_point).await?;
 
@@ -96,6 +97,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                 display_name,
                 image,
                 labels,
+                tls,
             )
             .await?;
         }
@@ -114,6 +116,7 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
         display_name: Option<String>,
         image: Option<String>,
         labels: std::collections::BTreeMap<String, String>,
+        tls: Option<crate::ports::compute::ComputeTlsMount>,
     ) -> std::result::Result<(), InitRepoError> {
         let compute = self.compute.as_ref().ok_or_else(|| {
             InitRepoError::Compute(ComputeError::Internal(
@@ -224,6 +227,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
             },
         )?;
         definition.host_data_dir = Some(workspace_data_dir);
+
+        if let Some(tls_mount) = tls {
+            crate::utils::engine_tls::apply_engine_tls(
+                &mut definition,
+                &provider_name,
+                &tls_mount.container_dir,
+            );
+            definition.tls = Some(tls_mount);
+        }
 
         #[cfg(unix)]
         {
@@ -592,7 +604,8 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            }
+                tls: None,
+}
         }
         fn default_port(&self) -> u16 {
             5432
@@ -664,6 +677,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -688,6 +702,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -718,6 +733,7 @@ mod tests {
                 None,
                 None,
                 labels.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -779,6 +795,7 @@ mod tests {
                 None,
                 None,
                 labels,
+                None,
             )
             .await
             .unwrap();
@@ -817,6 +834,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(matches!(
@@ -844,6 +862,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(matches!(
@@ -874,6 +893,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(first.is_ok(), "first init should succeed: {:?}", first);
@@ -890,6 +910,7 @@ mod tests {
                 None,
                 None,
                 Default::default(),
+                None,
             )
             .await;
         assert!(

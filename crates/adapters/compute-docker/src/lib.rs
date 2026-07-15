@@ -488,6 +488,11 @@ impl Compute for DockerCompute {
             let container_path = definition.data_dir.to_string_lossy();
             binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
+        if let Some(ref tls) = definition.tls {
+            let host_path = host_path_for_docker_bind(&resolve_host_bind_path(&tls.host_dir)?);
+            let container_path = tls.container_dir.to_string_lossy();
+            binds.push(self.bind_mount_spec(&host_path, &container_path).await);
+        }
 
         let host_config = bollard::service::HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
@@ -955,6 +960,11 @@ impl Compute for DockerCompute {
         if let Some(ref host_data) = definition.host_data_dir {
             let host_path = host_path_for_docker_bind(&resolve_host_bind_path(host_data)?);
             let container_path = definition.data_dir.to_string_lossy();
+            binds.push(self.bind_mount_spec(&host_path, &container_path).await);
+        }
+        if let Some(ref tls) = definition.tls {
+            let host_path = host_path_for_docker_bind(&resolve_host_bind_path(&tls.host_dir)?);
+            let container_path = tls.container_dir.to_string_lossy();
             binds.push(self.bind_mount_spec(&host_path, &container_path).await);
         }
 

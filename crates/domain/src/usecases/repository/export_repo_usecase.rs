@@ -388,7 +388,8 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-        }
+                tls: None,
+}
         }
         fn default_port(&self) -> u16 {
             5432
@@ -439,7 +440,8 @@ mod tests {
                         logs_dir: None,
                         conf_dir: None,
                         args: vec![],
-                    },
+                        tls: None,
+},
                     command: "pg_dump".into(),
                     output_filename: "export.sql".into(),
                 })

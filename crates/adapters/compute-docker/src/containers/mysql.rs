@@ -57,7 +57,8 @@ impl MysqlProvider {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        }
+            tls: None,
+}
     }
 }
 
@@ -299,7 +300,8 @@ impl DatabaseProvider for MysqlProvider {
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: format!(
                     "mysqldump -h {host} -P {port} -u root -p'{password}' {db} > /data/export.sql",
                     host = params.host,
@@ -321,7 +323,8 @@ impl DatabaseProvider for MysqlProvider {
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: format!(
                     "mysqldump -h {host} -P {port} -u root -p'{password}' --no-data {db} > /data/schema.sql",
                     host = params.host,
@@ -359,7 +362,8 @@ impl DatabaseProvider for MysqlProvider {
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: format!(
                     "mysql -h {host} -P {port} -u root -p'{password}' {db} < /data/{file}",
                     host = params.host,
@@ -570,7 +574,8 @@ MYSQL_PWD="{password}" mysqldump -h {host} -P {port} -u root --no-data --skip-co
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            },
+                tls: None,
+},
             command,
         }))
     }

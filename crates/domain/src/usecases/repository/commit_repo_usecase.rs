@@ -1234,7 +1234,8 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            }
+                tls: None,
+}
         }
         fn default_port(&self) -> u16 {
             5432

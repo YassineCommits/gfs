@@ -261,6 +261,29 @@ pub struct ComputeDefinition {
     /// Empty by default; the runtime should attach nothing when this is empty.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+
+    /// Optional host directory containing TLS material (`server.crt`, `server.key`,
+    /// `ca.pem`) mounted into the container at [`ComputeTlsMount::container_dir`].
+    #[serde(default)]
+    pub tls: Option<ComputeTlsMount>,
+}
+
+/// Host → container TLS bind for engine server certificates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComputeTlsMount {
+    /// Directory on the compute host (DP VM) with `server.crt` / `server.key` / `ca.pem`.
+    pub host_dir: PathBuf,
+    /// Mount point inside the container (default `/etc/guepard/tls`).
+    pub container_dir: PathBuf,
+}
+
+impl ComputeTlsMount {
+    pub fn new(host_dir: impl Into<PathBuf>, container_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            host_dir: host_dir.into(),
+            container_dir: container_dir.into(),
+        }
+    }
 }
 
 /// A single port mapping (host port optional; container port required).

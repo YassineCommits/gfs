@@ -73,7 +73,8 @@ impl PostgresqlProvider {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        }
+            tls: None,
+}
     }
 
     fn default_args_impl() -> Vec<DatabaseProviderArg> {
@@ -187,7 +188,8 @@ fn sidecar_definition(image: String, password: &str, data_dir: &str) -> ComputeD
         logs_dir: None,
         conf_dir: None,
         args: vec![],
-    }
+        tls: None,
+}
 }
 
 impl PostgresqlProvider {

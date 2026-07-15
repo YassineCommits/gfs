@@ -97,6 +97,7 @@ pub async fn init(
             None,
             image,
             labels,
+            None,
         )
         .await?;
 

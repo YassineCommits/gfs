@@ -638,7 +638,8 @@ GFS_SCHEMA_COLUMNS
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            }
+                tls: None,
+}
         }
         fn default_port(&self) -> u16 {
             5432
@@ -746,7 +747,8 @@ GFS_SCHEMA_COLUMNS
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: "echo test".into(),
             }),
         };
@@ -888,7 +890,8 @@ CREATE TABLE public.users (
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: "echo test".into(),
             }),
         };
@@ -969,7 +972,8 @@ GFS_SCHEMA_COLUMNS
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: "echo test".into(),
             }),
         };
@@ -1023,7 +1027,8 @@ GFS_SCHEMA_COLUMNS
                     logs_dir: None,
                     conf_dir: None,
                     args: vec![],
-                },
+                    tls: None,
+},
                 command: "echo test".into(),
             }),
         };

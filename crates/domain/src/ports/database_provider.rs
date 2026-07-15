@@ -584,7 +584,8 @@ mod tests {
                 logs_dir: None,
                 conf_dir: None,
                 args: vec![],
-            }
+                tls: None,
+}
         }
         fn default_port(&self) -> u16 {
             5432
@@ -688,7 +689,8 @@ mod tests {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        };
+            tls: None,
+};
         assert_eq!(provider.version_from_image(&def), "16");
         let def_latest = ComputeDefinition {
             labels: Default::default(),
@@ -701,7 +703,8 @@ mod tests {
             logs_dir: None,
             conf_dir: None,
             args: vec![],
-        };
+            tls: None,
+};
         assert_eq!(provider.version_from_image(&def_latest), "latest");
     }
 
