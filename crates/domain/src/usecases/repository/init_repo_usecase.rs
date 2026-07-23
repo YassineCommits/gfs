@@ -181,6 +181,15 @@ impl<R: DatabaseProviderRegistry> InitRepositoryUseCase<R> {
                     env.default = Some(password.clone());
                 }
             }
+            // Durable SoT on the client host (Ubuntu keyring style): never rely
+            // solely on container env / k8s Secret read-back for reveal.
+            crate::utils::credential_vault::RepoCredentialVault::open(repo_path)
+                .put_admin_password(&password)
+                .map_err(|e| {
+                    InitRepoError::Compute(ComputeError::Internal(format!(
+                        "failed to write .gfs/secrets/admin_password: {e}"
+                    )))
+                })?;
         }
         if let Some(db) = credentials.name {
             for env in &mut definition.env {
